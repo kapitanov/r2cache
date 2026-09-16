@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  # Keep the enabled set deliberate instead of inheriting changing defaults.
+  default: none
+  enable:
+    - durationcheck
+    - errcheck
+    - errorlint
+    - govet
+    - ineffassign
+    - nilerr
+    - nolintlint
+    - staticcheck
+    - testifylint
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # Explicit `_ =` remains available for best-effort cleanup.
+      check-blank: false
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    generated: strict
+    presets: []
+    warn-unused: true
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/kapitanov/r2cache
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

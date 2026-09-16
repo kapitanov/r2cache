@@ -1,0 +1,74 @@
+name: Golang
+
+on:
+  push:
+    branches:
+      - master
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - name: Build and vet with coverage
+        run: make build vet
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: redis
+            image: redis:7.4.2-alpine
+          - backend: valkey
+            image: valkey/valkey:8.0.2-alpine
+    env:
+      R2CACHE_TEST_IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - name: Race tests with coverage
+        run: make test
+      - name: Summarize coverage
+        run: |
+          awk '/^total:/ { print "Go statement coverage: **" $3 "**" }' .out/coverage/summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.backend }}
+          path: .out/coverage/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version-file: .golangci-lint-version
+          args: --config .golangci.yml ./...
+          verify: true
+          problem-matchers: true
