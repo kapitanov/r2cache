@@ -4,7 +4,6 @@
 
 [![Go 1.27+](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Go Reference](https://pkg.go.dev/badge/github.com/kapitanov/r2cache.svg)](https://pkg.go.dev/github.com/kapitanov/r2cache)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kapitanov/r2cache)](https://goreportcard.com/report/github.com/kapitanov/r2cache)
 [![GitHub License](https://img.shields.io/github/license/kapitanov/r2cache)](LICENSE)
 ![GitHub branch check runs](https://img.shields.io/github/check-runs/kapitanov/r2cache/master?label=build)
 ![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/kapitanov/r2cache)

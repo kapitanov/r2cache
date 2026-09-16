@@ -25,6 +25,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    name: test (${{ matrix.backend }})
     strategy:
       fail-fast: false
       matrix:
