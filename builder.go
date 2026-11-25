@@ -181,9 +181,11 @@ func (b *Builder[K, V]) LeaseDuration(duration time.Duration) *Builder[K, V] {
 // are truncated to whole milliseconds. Replicas in a namespace must use the same
 // policy. Refresh deadlines are best-effort under load or backend failures.
 type AutoRefreshPolicy struct {
-	// HotKeyLifetime is the time after the last external GetOrFetch read during
-	// which a key remains eligible for refresh. Background refreshes and HotKeys
-	// queries do not extend this window.
+	// HotKeyLifetime is the time after the last external GetOrFetch read that
+	// found a stored value during which a key remains eligible for refresh. A
+	// miss does not start or extend this window; after a successful fetch, the
+	// key becomes eligible on the next read that hits. Background refreshes and
+	// HotKeys queries do not extend the window.
 	HotKeyLifetime time.Duration
 
 	// UpdateInterval is the target delay from a successful fetch to its next
@@ -201,11 +203,12 @@ func (b *Builder[K, V]) DisableAutoRefresh() *Builder[K, V] {
 	return b
 }
 
-// EnableAutoRefresh enables hot-key tracking for external reads and starts a
-// background worker using policy. Refreshes use the same per-key leases and
-// global concurrency permits as foreground fetches. Invalid policy durations
-// cause Build to fail. Refresh errors leave an existing value until its TTL expires
-// and are retried on a later interval; they are not delivered to foreground readers.
+// EnableAutoRefresh enables hot-key tracking for external reads that find a
+// stored value and starts a background worker using policy. Refreshes use the
+// same per-key leases and global concurrency permits as foreground fetches.
+// Invalid policy durations cause Build to fail. Refresh errors leave an existing
+// value until its TTL expires and are retried on a later interval; they are not
+// delivered to foreground readers.
 func (b *Builder[K, V]) EnableAutoRefresh(policy AutoRefreshPolicy) *Builder[K, V] {
 	b.cfg.refresh = &policy
 	return b

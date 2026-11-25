@@ -71,6 +71,8 @@ func TestIntegration(t *testing.T) {
 		require.True(t, second.owned)
 		require.Equal(t, 1, mustGet(t, first, "product"))
 		require.Equal(t, 2, mustGet(t, second, "product"))
+		// The fetch above was a miss; a miss is not hot, so read again to hit.
+		require.Equal(t, 1, mustGet(t, first, "product"))
 		require.Equal(t, time.Minute, first.cfg.refresh.HotKeyLifetime)
 		require.ElementsMatch(t, []string{"product"}, first.HotKeys(ctx))
 		require.Empty(t, second.HotKeys(ctx))
@@ -101,6 +103,8 @@ func TestIntegration(t *testing.T) {
 					HotKeyLifetime: time.Minute,
 					UpdateInterval: 30 * time.Second,
 				}))
+				require.Equal(t, 42, mustGet(t, cache, "my-key"))
+				// The fetch above was a miss; a hit is what registers the key as hot.
 				require.Equal(t, 42, mustGet(t, cache, "my-key"))
 				// Inspect actual Redis keys, independent of the cache's key builder.
 				stored, err := admin.Get(ctx, tt.valueKey).Result()
@@ -362,6 +366,8 @@ func TestIntegration(t *testing.T) {
 		var calls atomic.Int64
 		policy := AutoRefreshPolicy{HotKeyLifetime: 650 * time.Millisecond, UpdateInterval: 150 * time.Millisecond}
 		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }).EnableAutoRefresh(policy).TTL(time.Second))
+		// First read misses and fetches; the second read hits and makes the key hot.
+		mustGet(t, c, "warm")
 		mustGet(t, c, "warm")
 		require.Equal(t, []string{"warm"}, c.HotKeys(ctx), "missing hot key")
 		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
@@ -370,6 +376,34 @@ func TestIntegration(t *testing.T) {
 		before := calls.Load()
 		time.Sleep(250 * time.Millisecond)
 		require.Equal(t, before, calls.Load(), "background fetch extended hot lifetime")
+	})
+
+	t.Run("failed miss is not refresh-eligible", func(t *testing.T) {
+		backendErr := errors.New("backend unavailable")
+		var calls atomic.Int64
+		policy := AutoRefreshPolicy{HotKeyLifetime: 900 * time.Millisecond, UpdateInterval: 150 * time.Millisecond}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(2*time.Second).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 0, backendErr }).
+			EnableAutoRefresh(policy))
+		_, err := c.GetOrFetch(ctx, "failed")
+		require.ErrorIs(t, err, backendErr)
+		require.Equal(t, int64(1), calls.Load(), "initial miss fetch")
+		time.Sleep(time.Second) // several UpdateInterval periods
+		require.Equal(t, int64(1), calls.Load(), "failed miss was retried by background refresh")
+		require.Empty(t, c.HotKeys(ctx), "failed miss became hot")
+	})
+
+	t.Run("successful miss becomes hot on next hit", func(t *testing.T) {
+		var calls atomic.Int64
+		policy := AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: 150 * time.Millisecond}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(3*time.Second).
+			Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }).
+			EnableAutoRefresh(policy))
+		require.Equal(t, 1, mustGet(t, c, "key"), "miss fetch")
+		require.Empty(t, c.HotKeys(ctx), "miss became hot")
+		require.Equal(t, 1, mustGet(t, c, "key"), "hit")
+		require.Equal(t, []string{"key"}, c.HotKeys(ctx), "hit did not register hot key")
+		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	})
 
 	t.Run("refresh and foreground share permits", func(t *testing.T) {
@@ -394,6 +428,8 @@ func TestIntegration(t *testing.T) {
 			LimitConcurrentFetches(1).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: 150 * time.Millisecond})
 		a := testCache(t, builder)
 		b := testCache(t, builder)
+		// The first read fetches; the second hits and schedules background work.
+		mustGet(t, a, "hot")
 		mustGet(t, a, "hot")
 		eventually(t, time.Second, func() bool { return calls.Load() >= 2 })
 		mustGet(t, b, "cold")

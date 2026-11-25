@@ -196,14 +196,18 @@ builder.EnableAutoRefresh(r2cache.AutoRefreshPolicy{
 })
 ```
 
-**Hotness follows external reads.** A key stays eligible for `HotKeyLifetime`
-after its last `GetOrFetch` access. Background refreshes and `HotKeys` queries do
-not extend that window.
+**Hotness follows successful external reads.** A key stays eligible for
+`HotKeyLifetime` after its last `GetOrFetch` access that found a stored value. A
+read that misses does not make the key hot: if its fetch succeeds, the key becomes
+refresh-eligible only when a later read finds the stored value. A failed fetch
+leaves no hot or due entry, so the background worker never retries it. Background
+refreshes and `HotKeys` queries do not extend the window.
 
-**Refresh work is paced across replicas.** Successful fetches schedule the next
-refresh after `UpdateInterval`. The shared scheduler spaces starts by approximately
-`UpdateInterval / hot-key-count`; each replica runs one background fetch worker.
-Foreground fetches and refreshes share the same leases and concurrency limit.
+**Refresh work is paced across replicas.** Successful fetches of hot keys schedule
+the next refresh after `UpdateInterval`. The shared scheduler spaces starts by
+approximately `UpdateInterval / hot-key-count`; each replica runs one background
+fetch worker. Foreground fetches and refreshes share the same leases and
+concurrency limit.
 
 Both policy durations must be at least 1 ms. Intervals are best-effort: slow
 backends, busy permits, and scheduler polling can delay work. Failed or busy
