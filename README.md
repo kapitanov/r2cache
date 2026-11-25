@@ -204,10 +204,11 @@ builder.EnableAutoRefresh(r2cache.AutoRefreshPolicy{
 **Hotness follows successful external reads that hit.** A key stays eligible for
 `HotKeyLifetime` after its last sampled `GetOrFetch` read that found a stored
 value. A read that misses does not make the key hot: if its fetch succeeds, the
-key becomes refresh-eligible only when a later read finds the stored value. A
-failed fetch leaves no hot or due entry, so the background worker never retries
-it. Background refreshes and `HotKeys`/`HotKeysLimit` queries do not extend the
-window.
+key becomes refresh-eligible only when a later read finds the stored value, and
+that hit schedules the first refresh. A cold fetch leaves no due entry, so
+one-off misses cannot crowd the due index. A failed fetch leaves no hot or due
+entry, so the background worker never retries it. Background refreshes and
+`HotKeys`/`HotKeysLimit` queries do not extend the window.
 
 **Hotness is sampled to keep reads cheap.** The read path records a key's hotness
 at most once per sample window of `min(UpdateInterval, HotKeyLifetime/2)`, clamped
@@ -218,8 +219,10 @@ disabled, the read path only reads the value: a hit or a miss performs no Redis
 writes.
 
 **Refresh work is paced across replicas.** Successful fetches of hot keys schedule
-the next refresh after `UpdateInterval`, and the read path never writes the due
-index. The shared scheduler spaces starts by approximately
+the next refresh after `UpdateInterval`. A read that marks a key hot adds a due
+entry only when none exists and never moves an existing one, so continuous reads
+cannot postpone refresh indefinitely. Cold fetches never touch the due index.
+The shared scheduler spaces starts by approximately
 `UpdateInterval / hot-key-count`; each replica runs one background fetch worker.
 Foreground fetches and refreshes share the same leases and concurrency limit.
 
