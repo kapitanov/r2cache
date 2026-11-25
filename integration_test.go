@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -234,6 +235,70 @@ func TestIntegration(t *testing.T) {
 		require.ErrorIs(t, <-result, context.Canceled)
 		follower := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+"-cancel").Fetch(func(context.Context, string) (int, error) { return 7, nil }).LimitConcurrentFetches(1))
 		require.Equal(t, 7, mustGet(t, follower, "key"), "failed recovery")
+	})
+
+	t.Run("acquire transport error releases lock and permit", func(t *testing.T) {
+		primeScripts(t, admin)
+		client := acquireTestClient(options)
+		t.Cleanup(func() { _ = client.Close() })
+		hook := &acquireReplyHook{}
+		hook.drops.Store(1)
+		client.AddHook(hook)
+
+		var calls atomic.Int64
+		c := testCache(t, NewBuilder[string, int]().UseRedisClient(client).KeyPrefix(t.Name()).
+			LimitConcurrentFetches(1).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }))
+		keys := c.keys("key")
+
+		_, err := c.GetOrFetch(ctx, "key")
+		require.ErrorIs(t, err, io.EOF, "injected acquire reply error lost")
+		require.Zero(t, calls.Load(), "fetched without a usable acquire reply")
+		assertAcquireCleaned(t, admin, keys, hook)
+	})
+
+	t.Run("acquire deadline releases lock and permit", func(t *testing.T) {
+		primeScripts(t, admin)
+		client := acquireTestClient(options)
+		t.Cleanup(func() { _ = client.Close() })
+		hook := &acquireReplyHook{deadline: true}
+		hook.drops.Store(1)
+		client.AddHook(hook)
+
+		var calls atomic.Int64
+		c := testCache(t, NewBuilder[string, int]().UseRedisClient(client).KeyPrefix(t.Name()).
+			LimitConcurrentFetches(1).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }))
+		keys := c.keys("key")
+
+		op, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		_, err := c.GetOrFetch(op, "key")
+		require.ErrorIs(t, err, context.DeadlineExceeded, "caller deadline not observed")
+		require.Zero(t, calls.Load(), "fetched without a usable acquire reply")
+		assertAcquireCleaned(t, admin, keys, hook)
+	})
+
+	t.Run("acquire recovery after dropped reply", func(t *testing.T) {
+		primeScripts(t, admin)
+		client := acquireTestClient(options)
+		t.Cleanup(func() { _ = client.Close() })
+		hook := &acquireReplyHook{}
+		hook.drops.Store(1)
+		client.AddHook(hook)
+
+		var calls atomic.Int64
+		c := testCache(t, NewBuilder[string, int]().UseRedisClient(client).KeyPrefix(t.Name()).
+			LimitConcurrentFetches(1).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 42, nil }))
+		keys := c.keys("key")
+
+		_, err := c.GetOrFetch(ctx, "key")
+		require.ErrorIs(t, err, io.EOF, "injected acquire reply error lost")
+		require.Equal(t, 42, mustGet(t, c, "key"), "retry after acquire error")
+		require.Equal(t, int64(1), calls.Load(), "cleanup disturbed the retry")
+		require.Zero(t, admin.Exists(ctx, keys[1]).Val(), "lock left after successful fetch")
+		require.Zero(t, admin.ZCard(ctx, keys[2]).Val(), "permit left after successful fetch")
 	})
 
 	t.Run("waiter cancellation preserves owner", func(t *testing.T) {
@@ -536,3 +601,79 @@ type brokenSerializer struct{}
 
 func (brokenSerializer) Marshal(int) ([]byte, error)  { return nil, errors.New("encode") }
 func (brokenSerializer) Unmarshal([]byte, *int) error { return errors.New("decode") }
+
+func acquireTestClient(options *redis.Options) *redis.Client {
+	opts := *options
+	opts.MaxRetries = -1 // The hook injects the failure; the client must not replay it.
+	return redis.NewClient(&opts)
+}
+
+func primeScripts(t *testing.T, client redis.Scripter) {
+	t.Helper()
+	for _, script := range []*redis.Script{readScript, acquireScript, releaseScript} {
+		require.NoError(t, script.Load(context.Background(), client).Err())
+	}
+}
+
+// assertAcquireCleaned proves the acquire script executed server-side before the
+// reply was dropped, and that no lock or permit remained for its token.
+func assertAcquireCleaned(t *testing.T, admin *redis.Client, keys []string, hook *acquireReplyHook) {
+	t.Helper()
+	nextErr, _ := hook.nextErr.Load().(error)
+	require.NoError(t, nextErr, "acquire did not reach the server")
+	token, ok := hook.token.Load().(string)
+	require.True(t, ok, "acquire token not observed")
+	require.ErrorIs(t, admin.Get(context.Background(), keys[1]).Err(), redis.Nil, "lock left behind")
+	require.ErrorIs(t, admin.ZScore(context.Background(), keys[2], token).Err(), redis.Nil, "permit left behind")
+}
+
+// acquireReplyHook drops the reply of the first successful acquire EVALSHA after
+// the server executed it, leaving the created lock and permit in place. deadline
+// waits for the caller context instead, covering a timeout observed after the
+// script ran. Other commands and later acquires pass through untouched.
+type acquireReplyHook struct {
+	drops    atomic.Int64
+	deadline bool
+	token    atomic.Value // string
+	nextErr  atomic.Value // error
+}
+
+func (h *acquireReplyHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *acquireReplyHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *acquireReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if cmd.Name() != "evalsha" || len(args) < 8 || fmt.Sprint(args[1]) != acquireScript.Hash() {
+			return next(ctx, cmd)
+		}
+
+		if err := next(ctx, cmd); err != nil {
+			h.nextErr.Store(err)
+			return err
+		}
+
+		// Only status 2 creates a lock and, with a limit, a permit. Returning the
+		// real reply for other statuses keeps failure injection out of those paths.
+		reply, ok := cmd.(*redis.Cmd)
+		if !ok {
+			return nil
+		}
+		result, ok := reply.Val().([]interface{})
+		if !ok || len(result) == 0 || result[0] != int64(2) {
+			return nil
+		}
+		if h.drops.Add(-1) < 0 {
+			return nil
+		}
+		h.token.Store(fmt.Sprint(args[7]))
+		if h.deadline {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return io.EOF
+	}
+}
