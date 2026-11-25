@@ -652,6 +652,9 @@ func TestIntegration(t *testing.T) {
 		}
 		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).
 			EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 10 * time.Second, UpdateInterval: interval}))
+		// Read twice: the miss fetches the value and the hit records hotness, so
+		// the key stays eligible for refresh even when a miss does not mark it hot.
+		require.Equal(t, 1, mustGet(t, c, "key"))
 		require.Equal(t, 1, mustGet(t, c, "key"))
 		eventually(t, 4*time.Second, func() bool {
 			mu.Lock()
