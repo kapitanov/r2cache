@@ -398,6 +398,70 @@ func TestIntegration(t *testing.T) {
 		require.Zero(t, admin.Exists(ctx, keys[0]).Val(), "expired owner stored a value")
 	})
 
+	t.Run("script replay is idempotent", func(t *testing.T) {
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }))
+		keys := c.keys("key")
+		acquire := func(token string) []interface{} {
+			t.Helper()
+			result, err := acquireScript.Run(ctx, admin, keys[:4], token, 30000, 1, 0, "key").Slice()
+			require.NoError(t, err)
+			return result
+		}
+
+		// First acquisition takes the lock and a global permit.
+		require.Equal(t, []interface{}{int64(2)}, acquire("token-a"))
+		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val())
+		score, err := admin.ZScore(ctx, keys[2], "token-a").Result()
+		require.NoError(t, err)
+
+		// Age the lease and permit, then replay the same token as a retried EVALSHA would.
+		require.NoError(t, admin.PExpire(ctx, keys[1], 100*time.Millisecond).Err())
+		require.NoError(t, admin.ZAdd(ctx, keys[2], redis.Z{Member: "token-a", Score: 1}).Err())
+		require.Equal(t, []interface{}{int64(2)}, acquire("token-a"), "replay reported own lock as busy")
+		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val(), "replay released ownership")
+		require.Greater(t, admin.PTTL(ctx, keys[1]).Val(), 20*time.Second, "replay did not renew the lease")
+		renewed, err := admin.ZScore(ctx, keys[2], "token-a").Result()
+		require.NoError(t, err)
+		require.Greater(t, renewed, score, "replay did not renew the permit")
+		require.Greater(t, admin.PTTL(ctx, keys[2]).Val(), 20*time.Second, "replay did not extend the permit set")
+
+		// A different token must still see the lock as busy.
+		require.Equal(t, []interface{}{int64(0)}, acquire("token-b"), "foreign token bypassed the lock")
+		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val())
+
+		payload := "42"
+		committed, err := commitScript.Run(ctx, admin, keys, "token-a", payload, 30000, 1, "key", 0).Int()
+		require.NoError(t, err)
+		require.Equal(t, 1, committed)
+		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
+		require.Zero(t, admin.Exists(ctx, keys[1]).Val())
+		_, err = admin.ZScore(ctx, keys[2], "token-a").Result()
+		require.ErrorIs(t, err, redis.Nil)
+
+		// Replaying the commit with the same token and payload reports the earlier success.
+		committed, err = commitScript.Run(ctx, admin, keys, "token-a", payload, 30000, 1, "key", 0).Int()
+		require.NoError(t, err)
+		require.Equal(t, 1, committed, "replayed commit reported lost lease")
+		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
+		require.Zero(t, admin.Exists(ctx, keys[1]).Val())
+
+		// A different token with the already stored payload also reports the stored
+		// result without side effects; the contract only forbids overwriting and
+		// resurrecting ownership.
+		committed, err = commitScript.Run(ctx, admin, keys, "token-b", payload, 30000, 1, "key", 0).Int()
+		require.NoError(t, err)
+		require.Equal(t, 1, committed)
+		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
+		require.Zero(t, admin.Exists(ctx, keys[1]).Val(), "replay resurrected ownership")
+
+		// A different payload from a non-owner must not overwrite the value.
+		committed, err = commitScript.Run(ctx, admin, keys, "token-b", "other", 30000, 1, "key", 0).Int()
+		require.NoError(t, err)
+		require.Zero(t, committed)
+		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val(), "lost owner overwrote the value")
+		require.Zero(t, admin.Exists(ctx, keys[1]).Val(), "lost owner resurrected the lock")
+	})
+
 	t.Run("shutdown and caller owned client", func(t *testing.T) {
 		client := redis.NewClient(options)
 		defer func() { _ = client.Close() }()

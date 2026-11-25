@@ -1,9 +1,21 @@
 -- Acquire per-key ownership and, when limited, a global permit atomically.
+-- Idempotent for retries: if the lock already holds this token, an earlier
+-- execution acquired it, so renew the lease (and permit) and report acquired
+-- instead of busy. A lock held by another token is still busy.
 -- KEYS: value, lock, permits, hot index. ARGV: token, lease ms, limit, refresh flag, user key.
 -- Returns: {0} busy, {1, value} cached, {2} acquired, {3} no longer hot.
 
 local t = redis.call('TIME')
 local now = tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)
+
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+ redis.call('PEXPIRE', KEYS[2], ARGV[2])
+ if tonumber(ARGV[3]) > 0 then
+  redis.call('ZADD', KEYS[3], now+tonumber(ARGV[2]), ARGV[1])
+  redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[2])*2)
+ end
+ return {2}
+end
 
 if ARGV[4] == '0' then
  local v = redis.call('GET', KEYS[1])
