@@ -791,6 +791,24 @@ func TestIntegration(t *testing.T) {
 		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	})
 
+	t.Run("scheduler polling honors the delay", func(t *testing.T) {
+		policy := AutoRefreshPolicy{HotKeyLifetime: 2 * time.Minute, UpdateInterval: 30 * time.Second}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(5*time.Minute).
+			Fetch(func(context.Context, string) (int, error) { return 1, nil }).
+			EnableAutoRefresh(policy))
+		require.Equal(t, 1, mustGet(t, c, "hot"), "miss fetch")
+		require.Equal(t, 1, mustGet(t, c, "hot"), "hit records hotness")
+		require.Equal(t, []string{"hot"}, c.HotKeys(ctx), "missing hot key")
+
+		// The one-second cap allows at most one scheduler call per second; the old
+		// 100ms cap produced roughly thirty calls in this window.
+		before := commandCalls(t, admin, "evalsha")
+		time.Sleep(3 * time.Second)
+		polls := commandCalls(t, admin, "evalsha") - before
+		t.Logf("next_refresh evalsha calls in 3s: %d", polls)
+		require.LessOrEqual(t, polls, int64(5), "scheduler polled faster than the cap allows")
+	})
+
 	t.Run("failed refresh backs off from failure", func(t *testing.T) {
 		const interval = 500 * time.Millisecond
 		backendErr := errors.New("backend unavailable")

@@ -73,6 +73,12 @@ func (c *Cache[K, V]) notifications() {
 	}
 }
 
+// maxRefreshDelay bounds the scheduler sleep. The shared script returns the
+// remaining time until the next permitted start; honoring it avoids polling
+// Redis ten times per second when nothing is due, while the bound keeps a newly
+// hot key from waiting for a long update interval.
+const maxRefreshDelay = time.Second
+
 func (c *Cache[K, V]) refresh() {
 	defer c.wg.Done()
 
@@ -96,7 +102,7 @@ func (c *Cache[K, V]) refresh() {
 		result, err := nextRefreshScript.Run(op, c.client, []string{c.base + "hot", c.base + "due", c.base + "pace"}, interval).Slice()
 		stop()
 
-		delay = 100 * time.Millisecond
+		delay = maxRefreshDelay
 		if err != nil || len(result) == 0 {
 			continue
 		}
@@ -107,11 +113,11 @@ func (c *Cache[K, V]) refresh() {
 		}
 
 		if ms > 0 {
-			delay = time.Duration(ms) * time.Millisecond
-		}
-
-		if delay > 100*time.Millisecond {
-			delay = 100 * time.Millisecond
+			delay = min(time.Duration(ms)*time.Millisecond, maxRefreshDelay)
+		} else {
+			// Nothing is due: poll at the configured interval so sub-second
+			// policies stay usable, but never sleep longer than the cap.
+			delay = min(c.cfg.refresh.UpdateInterval, maxRefreshDelay)
 		}
 
 		if len(result) > 1 {
