@@ -21,6 +21,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// cleanupTimeout bounds best-effort lock and permit releases run after an acquire
+// failure or a completed fetch. They use a fresh context because the caller's
+// context may already be canceled.
+const cleanupTimeout = 2 * time.Second
+
 // ErrClosed is returned by GetOrFetch when Shutdown has already begun. Operations
 // that were active when shutdown started are canceled instead. HotKeys reports a
 // closed cache through its nil result because its signature has no error return.
@@ -222,7 +227,7 @@ func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool
 	// replica may already own the key. The token guard keeps a replacement lock
 	// intact, and the lease remains the backstop for anything left behind.
 	discard := func() {
-		cleanup, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		cleanup, stop := context.WithTimeout(context.Background(), cleanupTimeout)
 		_ = releaseScript.Run(cleanup, c.client, []string{keys[1], keys[2], keys[5]}, token, string(key)).Err()
 		stop()
 	}
@@ -282,7 +287,7 @@ func (c *Cache[K, V]) fetch(ctx context.Context, key K, keys []string, token str
 	defer func() {
 		cancel(context.Canceled)
 		<-renewed
-		cleanup, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		cleanup, stop := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer stop()
 		_ = releaseScript.Run(cleanup, c.client, []string{keys[1], keys[2], keys[5]}, token, string(key)).Err()
 	}()
