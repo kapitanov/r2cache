@@ -22,6 +22,7 @@ const DefaultLeaseDuration = 30 * time.Second
 type config[K ~string, V any] struct {
 	client     redis.UniversalClient
 	url        string
+	options    *redis.Options
 	prefix     string
 	fetch      func(context.Context, K) (V, error)
 	serializer Serializer[V]
@@ -32,9 +33,12 @@ type config[K ~string, V any] struct {
 }
 
 // Builder collects cache settings before starting any workers or creating clients.
-// Construct one with NewBuilder; its zero value is not usable. Setters mutate the
-// builder and return it for chaining. The last setter for a feature wins, and
-// Build validates the final settings so an invalid value can be corrected.
+// Construct one with NewBuilder; its zero value is not usable. All methods require
+// a non-nil receiver: NewBuilder never returns nil, and setters on a nil builder
+// panic. Only Build tolerates a nil receiver, returning an error so a missing
+// builder fails cleanly instead of panicking. Setters mutate the builder and
+// return it for chaining. The last setter for a feature wins, and Build validates
+// the final settings so an invalid value can be corrected.
 // Builders are not safe for concurrent use. A builder may build multiple caches;
 // subsequent changes do not alter caches it has already built.
 type Builder[K ~string, V any] struct {
@@ -58,6 +62,8 @@ func NewBuilder[K ~string, V any]() *Builder[K, V] {
 // and leave the builder available for correction and reuse. An injected
 // *redis.ClusterClient requires a non-empty Redis hash tag in KeyPrefix; Build
 // rejects it otherwise, since every namespace key must map to one Cluster slot.
+// Build is the only Builder method that accepts a nil receiver, returning an
+// error rather than panicking.
 //
 // Each build snapshots the settings and refresh policy. Fetch callbacks,
 // serializers, metrics receivers, and an injected Redis client remain shared by
@@ -75,9 +81,12 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 		if cfg.url == "" {
 			return nil, errors.New("r2cache: Redis connection is required")
 		}
-		if _, err := redis.ParseURL(cfg.url); err != nil {
+		options, err := redis.ParseURL(cfg.url)
+		if err != nil {
 			return nil, err
 		}
+		options.ContextTimeoutEnabled = true
+		cfg.options = options
 	}
 	if _, ok := cfg.client.(*redis.ClusterClient); ok && !hasClusterHashTag(cfg.prefix) {
 		return nil, fmt.Errorf("r2cache: KeyPrefix %q has no Redis hash tag; Redis Cluster requires a non-empty hash tag in KeyPrefix (for example \"my-cache:{products}\") so all namespace keys share one slot", cfg.prefix)
@@ -130,9 +139,10 @@ func hasClusterHashTag(key string) bool {
 
 // RedisURL selects a standalone Redis or Valkey server using a redis:// or
 // rediss:// URL, including any credentials and database number in that URL.
-// Build validates the URL but does not check connectivity. The cache owns this
-// client and closes it on Shutdown. This method replaces any earlier
-// UseRedisClient setting; use that method for Sentinel or Cluster connections.
+// Build parses and validates the URL once, and newCache creates the client from
+// those parsed options; connectivity is not checked. The cache owns this client
+// and closes it on Shutdown. This method replaces any earlier UseRedisClient
+// setting; use that method for Sentinel or Cluster connections.
 func (b *Builder[K, V]) RedisURL(url string) *Builder[K, V] {
 	b.cfg.url = url
 	b.cfg.client = nil
@@ -269,6 +279,8 @@ func (b *Builder[K, V]) EnableAutoRefresh(policy AutoRefreshPolicy) *Builder[K, 
 // Serializer converts values to and from their Redis representation. Methods
 // must be safe for concurrent use, and all replicas sharing a namespace must use
 // compatible encodings. Serialization errors are returned by GetOrFetch.
+// Unmarshal takes []byte, so decoding a cached value copies the Redis string
+// once per call; the cache has no string-accepting variant for this reason.
 type Serializer[V any] interface {
 	// Marshal encodes a fetched value for storage. An error prevents that value
 	// from being cached. The returned bytes must remain valid and unchanged until

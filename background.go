@@ -122,7 +122,8 @@ func (c *Cache[K, V]) refresh() {
 
 		if len(result) > 1 {
 			if key, ok := result[1].(string); ok {
-				if _, _, err := c.attempt(c.ctx, K(key), true); err != nil {
+				k := K(key)
+				if _, _, err := c.attempt(c.ctx, k, c.keys(k), true); err != nil {
 					// The due time set before the attempt may already be past when a
 					// slow fetch fails. Defer from the failure instead; busy and
 					// no-longer-hot keys never reach this branch.
