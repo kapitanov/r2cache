@@ -3,6 +3,8 @@
 Approved contracts:
 
 - Keep `HotKeys(context.Context) []K`; return nil when unavailable.
+- Add `HotKeysLimit(context.Context, int) ([]K, bool)` for bounded, truncation-aware
+  reads; keep `HotKeys` unbounded for compatibility.
 - `Builder.Build` returns `*Cache[K,V]`; serializers decode into `*V`.
 - Renewable leases coordinate fetches. Recovery may overlap a stalled owner;
   expired owners cannot commit over newer results.

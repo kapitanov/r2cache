@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -887,6 +888,57 @@ func TestIntegration(t *testing.T) {
 		require.Empty(t, keys)
 		disabled := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+"-disabled").Fetch(func(context.Context, string) (int, error) { return 1, nil }))
 		require.Nil(t, disabled.HotKeys(ctx), "disabled refresh must return nil")
+	})
+
+	t.Run("bounded hot keys", func(t *testing.T) {
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		seeded := make([]string, 5)
+		for i := range seeded {
+			seeded[i] = fmt.Sprintf("key-%d", i)
+			require.Equal(t, 1, mustGet(t, c, seeded[i]))
+		}
+
+		all := c.HotKeys(ctx)
+		require.ElementsMatch(t, seeded, all, "HotKeys lost keys")
+
+		keys, truncated := c.HotKeysLimit(ctx, 2)
+		require.Len(t, keys, 2, "limit 2")
+		require.Equal(t, all[:2], keys, "limit 2 must return the oldest prefix")
+		require.True(t, truncated, "limit 2 left keys behind")
+
+		keys, truncated = c.HotKeysLimit(ctx, 5)
+		require.ElementsMatch(t, seeded, keys, "limit 5")
+		require.False(t, truncated, "limit 5 fit exactly")
+
+		keys, truncated = c.HotKeysLimit(ctx, 6)
+		require.ElementsMatch(t, seeded, keys, "limit 6")
+		require.False(t, truncated, "limit 6 exceeds the key count")
+
+		keys, truncated = c.HotKeysLimit(ctx, math.MaxInt)
+		require.ElementsMatch(t, seeded, keys, "limit MaxInt")
+		require.False(t, truncated, "limit MaxInt exceeds the key count")
+
+		keys, truncated = c.HotKeysLimit(ctx, 0)
+		require.Nil(t, keys, "limit 0")
+		require.False(t, truncated, "limit 0")
+
+		empty := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":empty").Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		keys, truncated = empty.HotKeysLimit(ctx, 3)
+		require.NotNil(t, keys, "empty result must be non-nil")
+		require.Empty(t, keys, "empty namespace")
+		require.False(t, truncated, "empty namespace")
+
+		c.Shutdown()
+		keys, truncated = c.HotKeysLimit(ctx, 2)
+		require.Nil(t, keys, "closed cache")
+		require.False(t, truncated, "closed cache")
+
+		client := redis.NewClient(options)
+		broken := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":broken").Fetch(func(context.Context, string) (int, error) { return 1, nil }).UseRedisClient(client).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		require.NoError(t, client.Close())
+		keys, truncated = broken.HotKeysLimit(ctx, 2)
+		require.Nil(t, keys, "Redis failure")
+		require.False(t, truncated, "Redis failure")
 	})
 
 	t.Run("refresh and foreground share permits", func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -389,6 +390,9 @@ func (c *Cache[K, V]) renew(ctx context.Context, cancel context.CancelCauseFunc,
 // slice means the query succeeded and no keys are currently eligible. The
 // signature has no error return, so compare against nil to tell the two cases
 // apart; len(result) == 0 conflates them.
+// The result is unbounded: Redis materializes the entire eligible set and this
+// call allocates O(n) keys, so its cost grows with the namespace's hot-key
+// population. Prefer HotKeysLimit when the caller needs a bounded result.
 // The result covers the shared namespace, not just this instance's reads. Calling
 // HotKeys neither fetches values nor extends their hot-key eligibility.
 func (c *Cache[K, V]) HotKeys(ctx context.Context) []K {
@@ -416,6 +420,59 @@ func (c *Cache[K, V]) HotKeys(ctx context.Context) []K {
 	}
 
 	return result
+}
+
+// HotKeysLimit returns up to limit eligible hot keys in oldest-sampled-access-first
+// order and reports whether the full result was truncated. Eligibility and order
+// follow the sampled-hotness semantics of HotKeys. It returns nil when refresh is
+// disabled, the cache is closed, the context is canceled, Redis fails, or
+// limit <= 0. A successful empty result is a non-nil empty slice, so nil is
+// unambiguously the unavailable sentinel.
+//
+// Redis is asked for at most limit+1 keys, so the reply and this call's allocation
+// are bounded by limit; truncated reports whether more eligible keys exist beyond
+// the returned page. Like HotKeys, the result covers the shared namespace, and
+// calling it neither fetches values nor extends hot-key eligibility.
+func (c *Cache[K, V]) HotKeysLimit(ctx context.Context, limit int) ([]K, bool) {
+	if limit <= 0 {
+		return nil, false
+	}
+
+	ctx, done, err := c.begin(ctx)
+	if err != nil {
+		return nil, false
+	}
+
+	defer done()
+
+	if c.cfg.refresh == nil {
+		return nil, false
+	}
+
+	// Request one extra key to tell a full page from a truncated one. At MaxInt
+	// there is no representable limit+1, but MaxInt itself is already a safe cap:
+	// a reply cannot contain more keys than an int can count.
+	request := limit
+	if limit < math.MaxInt {
+		request++
+	}
+
+	keys, err := hotKeysScript.Run(ctx, c.client, []string{c.base + "hot"}, request).StringSlice()
+	if err != nil {
+		return nil, false
+	}
+
+	truncated := len(keys) > limit
+	if truncated {
+		keys = keys[:limit]
+	}
+
+	result := make([]K, len(keys))
+	for i, key := range keys {
+		result[i] = K(key)
+	}
+
+	return result, truncated
 }
 
 // Shutdown cancels work, waits for callbacks and active operations, and closes an
