@@ -156,7 +156,7 @@ Redis clients remain shared and must support concurrent use.
 | ----------------------------- | ------------------ | ------------------------------------------------------------------ |
 | `RedisURL` / `UseRedisClient` | Required           | Select the Redis connection.                                       |
 | `Fetch`                       | Required           | Load a value from the backend.                                     |
-| `KeyPrefix`                | Empty namespace    | Isolate unrelated caches and coordinate replicas.                  |
+| `KeyPrefix`                | Empty namespace    | Isolate caches and replicas; Cluster needs a hash tag.              |
 | `TTL`                      | `5 * time.Minute`  | Set the lifetime of each stored value; minimum 1 ms.               |
 | `LeaseDuration`            | `30 * time.Second` | Set the recovery window for abandoned fetches; minimum 100 ms.     |
 | `LimitConcurrentFetches`      | Unlimited          | Limit active backend calls across the namespace; must be positive. |
@@ -303,11 +303,36 @@ hashed, escaped, or trimmed. An empty prefix adds no separator; a prefix already
 ending in `:` retains it, so `my-cache:` produces `my-cache::value:<encoded-key>`.
 User keys in value and lock names remain URL-safe base64 encoded.
 
-For **Redis Cluster**, supply a non-empty Redis hash tag yourself, for example
-`builder.KeyPrefix("my-cache:{products}")`. This keeps all keys in
-**one Cluster hash slot** so multi-key scripts and global limits work; without a
-shared tag, operations can fail with `CROSSSLOT`. A namespace is bounded by one
-shard's capacity; different tags may use different shards.
+### Redis Cluster: one namespace, one hash slot
+
+A namespace is deliberately pinned to **one Redis Cluster hash slot**. Values,
+locks, concurrency permits, the hot and due indexes, refresh pacing, and the events
+channel all derive from `KeyPrefix`, and the Lua scripts address several of them in
+one call, so Redis rejects them with `CROSSSLOT` unless every key hashes to the same
+slot.
+
+For **Redis Cluster**, the prefix must contain a non-empty Redis hash tag:
+
+```go
+client := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"redis-0:6379"}})
+cache, err := r2cache.NewBuilder[string, Product]().
+	UseRedisClient(client).
+	KeyPrefix("my-cache:{products}"). // all namespace keys hash to the slot of "products"
+	Fetch(fetchProduct).
+	Build()
+```
+
+Redis hashes only the content between the first `{` and the first `}` after it,
+and that content must be non-empty; later brace pairs are ignored. Thus
+`svc:{products}` and `a{b}c{d}` are accepted (tags `products` and `b`), while
+`svc`, `svc:{}`, and `a{}c{d}` are not. `Build` fails immediately, naming
+`KeyPrefix`, when an injected `*redis.ClusterClient` has no such tag; standalone
+Redis and Sentinel require no tag. The tag remains part of the prefix, so all
+replicas in the namespace must use it.
+
+A namespace is bounded by one shard's capacity and shares that shard with other
+namespaces using the same tag. Use distinct tags for unrelated data; different tags
+may land on different shards. `RedisURL` remains standalone-only.
 
 The previous SHA-256 namespace layout is no longer read. Existing values expire
 normally, and the new layout starts cold. Deploy the same key-layout version to

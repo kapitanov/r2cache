@@ -8,7 +8,9 @@ Approved contracts:
   expired owners cannot commit over newer results.
 - Use go-redis universal clients; one Redis Cluster hash slot per namespace.
 - Preserve key prefixes verbatim and add a colon separator for non-empty prefixes.
-  Cluster users supply their own Redis hash tag; no prefix hashing is performed.
+  Cluster users supply their own non-empty Redis hash tag; no prefix hashing is
+  performed. Build rejects an injected `*redis.ClusterClient` whose `KeyPrefix`
+  has no usable tag, rather than failing later with `CROSSSLOT`.
 - Use testcontainers-go for real Redis integration tests, locally and in GitHub.
 
 Implementation sequence:

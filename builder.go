@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -54,7 +55,9 @@ func NewBuilder[K ~string, V any]() *Builder[K, V] {
 
 // Build validates the current settings and starts an independent cache. It does
 // not check Redis connectivity. Validation failures allocate no client or worker
-// and leave the builder available for correction and reuse.
+// and leave the builder available for correction and reuse. An injected
+// *redis.ClusterClient requires a non-empty Redis hash tag in KeyPrefix; Build
+// rejects it otherwise, since every namespace key must map to one Cluster slot.
 //
 // Each build snapshots the settings and refresh policy. Fetch callbacks,
 // serializers, metrics receivers, and an injected Redis client remain shared by
@@ -75,6 +78,9 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 		if _, err := redis.ParseURL(cfg.url); err != nil {
 			return nil, err
 		}
+	}
+	if _, ok := cfg.client.(*redis.ClusterClient); ok && !hasClusterHashTag(cfg.prefix) {
+		return nil, fmt.Errorf("r2cache: KeyPrefix %q has no Redis hash tag; Redis Cluster requires a non-empty hash tag in KeyPrefix (for example \"my-cache:{products}\") so all namespace keys share one slot", cfg.prefix)
 	}
 	if cfg.serializer == nil {
 		return nil, errors.New("r2cache: nil serializer")
@@ -109,6 +115,19 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 	return newCache(cfg)
 }
 
+// hasClusterHashTag reports whether key contains the hash tag Redis Cluster
+// would use: the content between the first '{' and the first '}' after it. Redis
+// hashes the whole key when that content is empty or no closing brace follows,
+// and it ignores later brace pairs.
+func hasClusterHashTag(key string) bool {
+	open := strings.IndexByte(key, '{')
+	if open < 0 {
+		return false
+	}
+	end := strings.IndexByte(key[open+1:], '}')
+	return end > 0
+}
+
 // RedisURL selects a standalone Redis or Valkey server using a redis:// or
 // rediss:// URL, including any credentials and database number in that URL.
 // Build validates the URL but does not check connectivity. The cache owns this
@@ -122,8 +141,10 @@ func (b *Builder[K, V]) RedisURL(url string) *Builder[K, V] {
 
 // UseRedisClient selects a caller-owned standalone, Sentinel, or Cluster client,
 // replacing any earlier RedisURL setting. A nil client is rejected by Build.
-// Configure the client to read from primaries and honor context deadlines.
-// Shutdown leaves the client open; close it after all caches using it shut down.
+// For a *redis.ClusterClient, KeyPrefix must contain a non-empty Redis hash tag;
+// Build rejects it otherwise. Configure the client to read from primaries and
+// honor context deadlines. Shutdown leaves the client open; close it after all
+// caches using it shut down.
 func (b *Builder[K, V]) UseRedisClient(client redis.UniversalClient) *Builder[K, V] {
 	b.cfg.client = client
 	b.cfg.url = ""
@@ -134,8 +155,17 @@ func (b *Builder[K, V]) UseRedisClient(client redis.UniversalClient) *Builder[K,
 // key. For example, "my-cache" produces "my-cache:value:<encoded-key>" and
 // "my-cache:hot". The default empty prefix adds neither a prefix nor a separator.
 // Prefixes are not hashed, escaped, or trimmed; "my-cache:" produces "my-cache::".
-// For Redis Cluster, include a non-empty Redis hash tag in the prefix yourself
-// (for example, "my-cache:{products}") so multi-key scripts use a single slot.
+//
+// A namespace is intentionally pinned to one Redis Cluster hash slot: values,
+// locks, permits, the hot and due indexes, refresh pacing, and the events channel
+// all derive from the prefix, and the Lua scripts address several of them in one
+// call, so Redis requires them to share a slot. Standalone Redis and Sentinel need
+// no tag. For Redis Cluster, include a non-empty Redis hash tag in the prefix
+// yourself (for example, "my-cache:{products}"); Redis hashes the content between
+// the first "{" and the first "}" after it and ignores later pairs. Build rejects
+// an injected *redis.ClusterClient whose KeyPrefix has no non-empty tag, since the
+// namespace would otherwise fail with CROSSSLOT at the first read.
+//
 // All replicas in a namespace must agree on configuration, key/value types,
 // serialization, and fetch semantics. Use separate namespaces for unrelated data.
 func (b *Builder[K, V]) KeyPrefix(prefix string) *Builder[K, V] {
