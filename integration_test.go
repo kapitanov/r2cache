@@ -476,7 +476,7 @@ func TestIntegration(t *testing.T) {
 		// First acquisition takes the lock and a global permit.
 		require.Equal(t, []interface{}{int64(2)}, acquire("token-a"))
 		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val())
-		score, err := admin.ZScore(ctx, keys[2], "token-a").Result()
+		_, err := admin.ZScore(ctx, keys[2], "token-a").Result()
 		require.NoError(t, err)
 
 		// Age the lease and permit, then replay the same token as a retried EVALSHA would.
@@ -487,7 +487,9 @@ func TestIntegration(t *testing.T) {
 		require.Greater(t, admin.PTTL(ctx, keys[1]).Val(), 20*time.Second, "replay did not renew the lease")
 		renewed, err := admin.ZScore(ctx, keys[2], "token-a").Result()
 		require.NoError(t, err)
-		require.Greater(t, renewed, score, "replay did not renew the permit")
+		// The score was aged to 1 above, so any real renewal is far greater even
+		// when the replay lands in the same Redis millisecond as the first acquire.
+		require.Greater(t, renewed, float64(1), "replay did not renew the permit")
 		require.Greater(t, admin.PTTL(ctx, keys[2]).Val(), 20*time.Second, "replay did not extend the permit set")
 
 		// A different token must still see the lock as busy.
