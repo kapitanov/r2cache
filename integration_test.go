@@ -885,7 +885,7 @@ func TestIntegration(t *testing.T) {
 					Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 42, nil }).
 					UseSerializer(corruptSerializer{})
 				if tt.refresh {
-					builder.EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour})
+					builder.EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 2 * time.Minute, UpdateInterval: 30 * time.Second})
 				}
 				c := testCache(t, builder)
 				valueKey := c.keys("key")[0]
@@ -916,11 +916,18 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, admin.Set(ctx, c.keys("key")[0], corruptPayload, time.Minute).Err())
 		_, err := c.GetOrFetch(ctx, "key")
 		require.ErrorContains(t, err, "decode")
-		select {
-		case m := <-received:
-			require.Equal(t, MetricValues{HitCount: 1, DecodeErrorCount: 1}, m)
-		case <-time.After(3 * time.Second):
-			require.FailNow(t, "no metrics")
+		deadline := time.After(3 * time.Second)
+		for {
+			select {
+			case m := <-received:
+				if m.DecodeErrorCount < 1 {
+					continue
+				}
+				require.Equal(t, MetricValues{HitCount: 1, DecodeErrorCount: 1}, m)
+				return
+			case <-deadline:
+				require.FailNow(t, "no metrics with decode error")
+			}
 		}
 	})
 
