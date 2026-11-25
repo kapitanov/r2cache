@@ -152,7 +152,9 @@ func (c *Cache[K, V]) decode(data string) (V, error) {
 //
 // With auto-refresh enabled, an initial lookup that finds a stored value records
 // this external access; a cache miss does not. A key fetched after a miss becomes
-// hot on a later read that hits. Background refreshes do not extend that window.
+// hot on a later read that hits. Hotness is sampled at most once per sample
+// window, so eligibility is best-effort within that window; background refreshes
+// do not extend it. With refresh disabled, the initial lookup performs no writes.
 // The context bounds waiting and is passed to a callback owned by this call.
 // Canceling a waiter does not cancel another reader's fetch. Fetchers must honor
 // cancellation: the owning call waits for its callback to return before completing.
@@ -174,7 +176,7 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 		interval = p.UpdateInterval.Milliseconds()
 	}
 
-	data, err := readScript.Run(ctx, c.client, []string{keys[0], keys[3], keys[4]}, string(key), hot, interval).Text()
+	data, err := readScript.Run(ctx, c.client, []string{keys[0], keys[3]}, string(key), hot, interval).Text()
 	if err == nil {
 		c.hits.Add(1)
 		return c.decode(data)
@@ -311,12 +313,13 @@ func (c *Cache[K, V]) fetch(ctx context.Context, key K, keys []string, token str
 		return zero, fmt.Errorf("r2cache: encode: %w", err)
 	}
 
-	var interval int64
+	var hot, interval int64
 	if c.cfg.refresh != nil {
+		hot = c.cfg.refresh.HotKeyLifetime.Milliseconds()
 		interval = c.cfg.refresh.UpdateInterval.Milliseconds()
 	}
 
-	committed, err := commitScript.Run(fetchCtx, c.client, keys, token, data, c.cfg.ttl.Milliseconds(), c.cfg.max, string(key), interval).Int()
+	committed, err := commitScript.Run(fetchCtx, c.client, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, token, data, c.cfg.ttl.Milliseconds(), c.cfg.max, string(key), interval, hot).Int()
 	if err != nil {
 		return zero, fmt.Errorf("r2cache: commit: %w", err)
 	}
@@ -351,10 +354,15 @@ func (c *Cache[K, V]) renew(ctx context.Context, cancel context.CancelCauseFunc,
 	}
 }
 
-// HotKeys returns keys whose last external read lies within HotKeyLifetime, in
-// oldest-access-first order. It returns nil when refresh is disabled, the cache
-// is closed, the context is canceled, or Redis fails. Errors cannot be distinguished
-// from an empty result through this slice-only API.
+// HotKeys returns keys whose last sampled external read lies within
+// HotKeyLifetime, in oldest-sampled-access-first order. Hotness is recorded at
+// most once per sample window of min(UpdateInterval, HotKeyLifetime/2), at least
+// 1ms. Sampling never extends eligibility beyond an exact last-read window: it
+// can expire up to one window earlier, and the reported access order can lag by
+// up to one window. Within that bound, eligibility is best-effort, not an exact
+// read trace. HotKeys returns nil when refresh is disabled, the cache is closed,
+// the context is canceled, or Redis fails. Errors cannot be distinguished from
+// an empty result through this slice-only API.
 // The result covers the shared namespace, not just this instance's reads. Calling
 // HotKeys neither fetches values nor extends their hot-key eligibility.
 func (c *Cache[K, V]) HotKeys(ctx context.Context) []K {

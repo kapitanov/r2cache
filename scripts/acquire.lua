@@ -25,8 +25,10 @@ else
  if not hot or tonumber(hot) <= now then return {3} end
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then return {0} end
-redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
-if tonumber(ARGV[3]) > 0 and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[3]) then return {0} end
+if tonumber(ARGV[3]) > 0 then
+ redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+ if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[3]) then return {0} end
+end
 redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
 if tonumber(ARGV[3]) > 0 then
  redis.call('ZADD', KEYS[3], now+tonumber(ARGV[2]), ARGV[1])

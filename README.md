@@ -196,18 +196,26 @@ builder.EnableAutoRefresh(r2cache.AutoRefreshPolicy{
 })
 ```
 
-**Hotness follows successful external reads.** A key stays eligible for
-`HotKeyLifetime` after its last `GetOrFetch` access that found a stored value. A
-read that misses does not make the key hot: if its fetch succeeds, the key becomes
-refresh-eligible only when a later read finds the stored value. A failed fetch
-leaves no hot or due entry, so the background worker never retries it. Background
-refreshes and `HotKeys` queries do not extend the window.
+**Hotness follows successful external reads that hit.** A key stays eligible for
+`HotKeyLifetime` after its last sampled `GetOrFetch` read that found a stored
+value. A read that misses does not make the key hot: if its fetch succeeds, the
+key becomes refresh-eligible only when a later read finds the stored value. A
+failed fetch leaves no hot or due entry, so the background worker never retries
+it. Background refreshes and `HotKeys` queries do not extend the window.
+
+**Hotness is sampled to keep reads cheap.** The read path records a key's hotness
+at most once per sample window of `min(UpdateInterval, HotKeyLifetime/2)`, clamped
+to at least 1 ms. Reads inside the window skip the hot-index write. `HotKeys` and
+refresh eligibility are therefore best-effort within that window; the window is
+shorter than `HotKeyLifetime`, so a continuously read key stays hot. With refresh
+disabled, the read path only reads the value: a hit or a miss performs no Redis
+writes.
 
 **Refresh work is paced across replicas.** Successful fetches of hot keys schedule
-the next refresh after `UpdateInterval`. The shared scheduler spaces starts by
-approximately `UpdateInterval / hot-key-count`; each replica runs one background
-fetch worker. Foreground fetches and refreshes share the same leases and
-concurrency limit.
+the next refresh after `UpdateInterval`, and the read path never writes the due
+index. The shared scheduler spaces starts by approximately
+`UpdateInterval / hot-key-count`; each replica runs one background fetch worker.
+Foreground fetches and refreshes share the same leases and concurrency limit.
 
 Both policy durations must be at least 1 ms and are truncated to whole
 milliseconds. `Build` rejects a policy whose `UpdateInterval` is greater than or
@@ -222,10 +230,12 @@ almost immediate retry. Busy attempts and keys that are no longer hot are not
 deferred this way. An existing value remains only until its original TTL. Idle
 scheduler polling is at most every 100 ms.
 
-`cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest access
-first. It returns `nil` when refresh is disabled or the cache, context, or Redis
-is unavailable. Its slice-only signature cannot distinguish an unavailable result
-from an empty set.
+`cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest sampled
+access first. Because hotness is sampled, eligibility can end up to one sample
+window earlier than an exact last-read window would, and the reported order can
+lag by up to the same bound. It returns `nil` when refresh is disabled or the
+cache, context, or Redis is unavailable. Its slice-only signature cannot
+distinguish an unavailable result from an empty set.
 
 ## Coordination and recovery
 
@@ -308,7 +318,7 @@ Register a callback with `builder.MetricsReceiver(receiver)`. It receives a
 | `HitCount`          | Local, cumulative | Initial reads that found a value, including decoding failures.        |
 | `MissCount`         | Local, cumulative | Initial reads that found no value, including waiters.                 |
 | `BackendFetchCount` | Local, cumulative | Fetch callback invocations, including refreshes and failures.         |
-| `HotKeyCount`       | Global, current   | Eligible hot keys; `0` when refresh is disabled, `-1` if unavailable. |
+| `HotKeyCount`       | Global, current   | Sampled eligible hot keys; `0` when refresh is disabled, `-1` if unavailable. |
 
 Counters start at zero per cache and do not reset after delivery. Redis lookup
 errors count as neither hits nor misses. Fields are sampled separately, not as

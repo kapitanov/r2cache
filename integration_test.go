@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -176,6 +177,29 @@ func waiterCount(c *Cache[string, int]) int {
 	return len(c.waiters)
 }
 
+// commandCalls returns the cumulative execution count of one Redis command,
+// including calls made from Lua scripts. INFO resets nothing, so callers
+// compare snapshots taken around the operation under test.
+func commandCalls(t *testing.T, client *redis.Client, command string) int64 {
+	t.Helper()
+	info, err := client.Do(context.Background(), "INFO", "commandstats").Text()
+	require.NoError(t, err)
+	for _, line := range strings.Split(info, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "cmdstat_"+command+":")
+		if !ok {
+			continue
+		}
+		for _, field := range strings.Split(rest, ",") {
+			if calls, ok := strings.CutPrefix(field, "calls="); ok {
+				n, err := strconv.ParseInt(calls, 10, 64)
+				require.NoError(t, err)
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 func TestIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration tests require Docker")
@@ -267,6 +291,114 @@ func TestIntegration(t *testing.T) {
 		other := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+"-other").Fetch(fetch))
 		require.Equal(t, 3, mustGet(t, other, "{key}:a\x00"), "namespace collision")
 		require.Empty(t, c.HotKeys(ctx), "refresh disabled but hot keys present")
+	})
+
+	t.Run("no-refresh reads are write-free", func(t *testing.T) {
+		var calls atomic.Int64
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).
+			Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }))
+		require.Equal(t, 1, mustGet(t, c, "key"), "initial miss fetch")
+
+		before := map[string]int64{}
+		for _, command := range []string{"get", "time", "zadd", "zrem", "pexpire", "expire"} {
+			before[command] = commandCalls(t, admin, command)
+		}
+		require.Equal(t, 1, mustGet(t, c, "key"), "cache hit")
+		for _, command := range []string{"time", "zadd", "zrem", "pexpire", "expire"} {
+			require.Equal(t, before[command], commandCalls(t, admin, command), "read hit issued %s", command)
+		}
+		require.Equal(t, before["get"]+1, commandCalls(t, admin, "get"), "read hit did not look up the value")
+
+		// A read miss must also leave the hot and due indexes untouched. Call the
+		// script directly so acquire, fetch, and commit writes do not obscure it.
+		missing := c.keys("missing")
+		beforeMiss := commandCalls(t, admin, "time")
+		for _, command := range []string{"zadd", "zrem", "pexpire", "expire"} {
+			before[command] = commandCalls(t, admin, command)
+		}
+		_, err := readScript.Run(ctx, admin, []string{missing[0], missing[3]}, "missing", 0, 0).Text()
+		require.ErrorIs(t, err, redis.Nil)
+		require.Equal(t, beforeMiss, commandCalls(t, admin, "time"), "read miss issued TIME")
+		for _, command := range []string{"zadd", "zrem", "pexpire", "expire"} {
+			require.Equal(t, before[command], commandCalls(t, admin, command), "read miss issued %s", command)
+		}
+		require.Zero(t, admin.Exists(ctx, missing[3], missing[4]).Val(), "read miss wrote an index")
+	})
+
+	t.Run("refresh reads sample hotness", func(t *testing.T) {
+		var calls atomic.Int64
+		// Keep UpdateInterval below both HotKeyLifetime and TTL for issue #5.
+		policy := AutoRefreshPolicy{HotKeyLifetime: 10 * time.Second, UpdateInterval: 2 * time.Second}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(time.Minute).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }).
+			EnableAutoRefresh(policy))
+		keys := c.keys("key")
+
+		require.Equal(t, 1, mustGet(t, c, "key"), "initial miss fetch")
+		dueScore, err := admin.ZScore(ctx, keys[4], "key").Result()
+		require.NoError(t, err, "commit did not schedule the next refresh")
+		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val())
+		require.Zero(t, admin.Exists(ctx, keys[3]).Val(), "miss recorded hotness")
+
+		require.Equal(t, 1, mustGet(t, c, "key"), "first hit")
+		hotBefore, err := admin.ZScore(ctx, keys[3], "key").Result()
+		require.NoError(t, err, "hit did not record hotness")
+		dueBefore, err := admin.ZScore(ctx, keys[4], "key").Result()
+		require.NoError(t, err)
+		require.InDelta(t, dueScore, dueBefore, 0, "hit changed the due schedule")
+
+		require.Equal(t, 1, mustGet(t, c, "key"), "second immediate hit")
+		hotAfter, err := admin.ZScore(ctx, keys[3], "key").Result()
+		require.NoError(t, err)
+		require.InDelta(t, hotBefore, hotAfter, 0, "hot score written inside the sample window")
+		dueAfter, err := admin.ZScore(ctx, keys[4], "key").Result()
+		require.NoError(t, err)
+		require.InDelta(t, dueScore, dueAfter, 0, "read wrote the due index")
+		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val(), "read added a due member")
+
+		// After the sample window, the next hit records access again.
+		sample := min(policy.UpdateInterval, policy.HotKeyLifetime/2)
+		lastAccess := hotBefore - float64(policy.HotKeyLifetime.Milliseconds())
+		eventually(t, sample+time.Second, func() bool {
+			now, err := admin.Time(ctx).Result()
+			return err == nil && float64(now.UnixMilli()) >= lastAccess+float64(sample.Milliseconds())
+		})
+		// The due entry from the first commit fires during the window. A
+		// background refresh replaces the value but must not touch the hot score.
+		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
+		indexed, err := admin.ZScore(ctx, keys[3], "key").Result()
+		require.NoError(t, err)
+		require.InDelta(t, hotBefore, indexed, 0, "background refresh wrote the hot score")
+		require.Equal(t, 1, mustGet(t, c, "key"), "hit after the sample window")
+		hotLater, err := admin.ZScore(ctx, keys[3], "key").Result()
+		require.NoError(t, err)
+		require.Greater(t, hotLater, hotBefore, "hit after the sample window did not record access")
+	})
+
+	t.Run("continuous reads stay hot while sampling", func(t *testing.T) {
+		var calls atomic.Int64
+		policy := AutoRefreshPolicy{HotKeyLifetime: 600 * time.Millisecond, UpdateInterval: 200 * time.Millisecond}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(2*time.Second).
+			Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }).
+			EnableAutoRefresh(policy))
+		require.Equal(t, 1, mustGet(t, c, "continuous"), "initial miss fetch")
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.After(2 * policy.HotKeyLifetime)
+	loop:
+		for {
+			select {
+			case <-deadline:
+				break loop
+			case <-ticker.C:
+				op, cancel := context.WithTimeout(ctx, 5*time.Second)
+				_, err := c.GetOrFetch(op, "continuous")
+				cancel()
+				require.NoError(t, err)
+				require.Equal(t, []string{"continuous"}, c.HotKeys(ctx), "continuously read key fell out of the hot set")
+			}
+		}
+		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	})
 
 	t.Run("cross instance singleflight and renewal", func(t *testing.T) {
@@ -675,6 +807,27 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("acquire skips permit prune without a limit", func(t *testing.T) {
+		var calls atomic.Int64
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).
+			Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }))
+		keys := c.keys("key")
+		require.NoError(t, admin.ZAdd(ctx, keys[2], redis.Z{Member: "stale", Score: 1}).Err())
+		before := commandCalls(t, admin, "zremrangebyscore")
+		require.Equal(t, 1, mustGet(t, c, "key"))
+		require.Equal(t, before, commandCalls(t, admin, "zremrangebyscore"), "pruned permits without a limit")
+		score, err := admin.ZScore(ctx, keys[2], "stale").Result()
+		require.NoError(t, err, "stale permit removed without a limit")
+		require.InDelta(t, 1, score, 0)
+
+		limited := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+"-limited").
+			Fetch(func(context.Context, string) (int, error) { return 1, nil }).LimitConcurrentFetches(1))
+		limitedKeys := limited.keys("key")
+		require.NoError(t, admin.ZAdd(ctx, limitedKeys[2], redis.Z{Member: "stale", Score: 1}).Err())
+		require.Equal(t, 1, mustGet(t, limited, "key"))
+		require.ErrorIs(t, admin.ZScore(ctx, limitedKeys[2], "stale").Err(), redis.Nil, "limited acquire did not prune permits")
+	})
+
 	t.Run("refresh and foreground share permits", func(t *testing.T) {
 		var active, peak, calls atomic.Int64
 		fetch := func(ctx context.Context, _ string) (int, error) {
@@ -762,7 +915,7 @@ func TestIntegration(t *testing.T) {
 		renewed, err := renewScript.Run(ctx, admin, []string{keys[1], keys[2]}, "old", 1000, 1).Int()
 		require.NoError(t, err)
 		require.Zero(t, renewed, "renewed expired permit")
-		committed, err := commitScript.Run(ctx, admin, keys, "old", "1", 1000, 1, "key", 0).Int()
+		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "old", "1", 1000, 1, "key", 0, 0).Int()
 		require.NoError(t, err)
 		require.Zero(t, committed, "committed with expired permit")
 		require.Zero(t, admin.Exists(ctx, keys[0]).Val(), "expired owner stored a value")
@@ -802,7 +955,7 @@ func TestIntegration(t *testing.T) {
 		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val())
 
 		payload := "42"
-		committed, err := commitScript.Run(ctx, admin, keys, "token-a", payload, 30000, 1, "key", 0).Int()
+		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-a", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
@@ -811,7 +964,7 @@ func TestIntegration(t *testing.T) {
 		require.ErrorIs(t, err, redis.Nil)
 
 		// Replaying the commit with the same token and payload reports the earlier success.
-		committed, err = commitScript.Run(ctx, admin, keys, "token-a", payload, 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-a", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed, "replayed commit reported lost lease")
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
@@ -820,14 +973,14 @@ func TestIntegration(t *testing.T) {
 		// A different token with the already stored payload also reports the stored
 		// result without side effects; the contract only forbids overwriting and
 		// resurrecting ownership.
-		committed, err = commitScript.Run(ctx, admin, keys, "token-b", payload, 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-b", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
 		require.Zero(t, admin.Exists(ctx, keys[1]).Val(), "replay resurrected ownership")
 
 		// A different payload from a non-owner must not overwrite the value.
-		committed, err = commitScript.Run(ctx, admin, keys, "token-b", "other", 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-b", "other", 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Zero(t, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val(), "lost owner overwrote the value")
