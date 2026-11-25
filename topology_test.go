@@ -103,7 +103,8 @@ func TestClusterKeyPrefixValidation(t *testing.T) {
 				Build()
 			if !tt.valid {
 				require.ErrorContains(t, err, "KeyPrefix")
-				require.ErrorContains(t, err, "Redis Cluster requires a non-empty hash tag")
+				require.ErrorContains(t, err, "Redis Cluster or Redis Ring")
+				require.ErrorContains(t, err, "non-empty hash tag")
 				require.Nil(t, cache)
 				return
 			}

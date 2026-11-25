@@ -59,11 +59,11 @@ func NewBuilder[K ~string, V any]() *Builder[K, V] {
 
 // Build validates the current settings and starts an independent cache. It does
 // not check Redis connectivity. Validation failures allocate no client or worker
-// and leave the builder available for correction and reuse. An injected
-// *redis.ClusterClient requires a non-empty Redis hash tag in KeyPrefix; Build
-// rejects it otherwise, since every namespace key must map to one Cluster slot.
-// Build is the only Builder method that accepts a nil receiver, returning an
-// error rather than panicking.
+// and leave the builder available for correction and reuse. An injected sharded
+// client (*redis.ClusterClient or *redis.Ring) requires a non-empty Redis hash tag
+// in KeyPrefix; Build rejects it otherwise, since every namespace key must map to
+// one Cluster slot or Ring shard. Build is the only Builder method that accepts a
+// nil receiver, returning an error rather than panicking.
 //
 // Each build snapshots the settings and refresh policy. Fetch callbacks,
 // serializers, metrics receivers, and an injected Redis client remain shared by
@@ -88,8 +88,8 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 		options.ContextTimeoutEnabled = true
 		cfg.options = options
 	}
-	if _, ok := cfg.client.(*redis.ClusterClient); ok && !hasClusterHashTag(cfg.prefix) {
-		return nil, fmt.Errorf("r2cache: KeyPrefix %q has no Redis hash tag; Redis Cluster requires a non-empty hash tag in KeyPrefix (for example \"my-cache:{products}\") so all namespace keys share one slot", cfg.prefix)
+	if isShardedClient(cfg.client) && !hasClusterHashTag(cfg.prefix) {
+		return nil, fmt.Errorf("r2cache: KeyPrefix %q has no Redis hash tag; a sharded client (Redis Cluster or Redis Ring) requires a non-empty hash tag in KeyPrefix (for example \"my-cache:{products}\") so all namespace keys share one slot or shard", cfg.prefix)
 	}
 	if cfg.serializer == nil {
 		return nil, errors.New("r2cache: nil serializer")
@@ -124,10 +124,22 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 	return newCache(cfg)
 }
 
-// hasClusterHashTag reports whether key contains the hash tag Redis Cluster
-// would use: the content between the first '{' and the first '}' after it. Redis
-// hashes the whole key when that content is empty or no closing brace follows,
-// and it ignores later brace pairs.
+// isShardedClient reports whether client distributes keys by hash: Redis Cluster
+// assigns hash slots, and Redis Ring assigns shards by rendezvous hashing. Both
+// honor hash tags, so a namespace on either client needs one.
+func isShardedClient(client redis.UniversalClient) bool {
+	switch client.(type) {
+	case *redis.ClusterClient, *redis.Ring:
+		return true
+	default:
+		return false
+	}
+}
+
+// hasClusterHashTag reports whether key contains the hash tag sharded clients
+// (Redis Cluster and Redis Ring) would use: the content between the first '{' and
+// the first '}' after it. Both hash the whole key when that content is empty or no
+// closing brace follows, and they ignore later brace pairs.
 func hasClusterHashTag(key string) bool {
 	open := strings.IndexByte(key, '{')
 	if open < 0 {
@@ -142,19 +154,19 @@ func hasClusterHashTag(key string) bool {
 // Build parses and validates the URL once, and newCache creates the client from
 // those parsed options; connectivity is not checked. The cache owns this client
 // and closes it on Shutdown. This method replaces any earlier UseRedisClient
-// setting; use that method for Sentinel or Cluster connections.
+// setting; use that method for Sentinel, Cluster, or Ring connections.
 func (b *Builder[K, V]) RedisURL(url string) *Builder[K, V] {
 	b.cfg.url = url
 	b.cfg.client = nil
 	return b
 }
 
-// UseRedisClient selects a caller-owned standalone, Sentinel, or Cluster client,
-// replacing any earlier RedisURL setting. A nil client is rejected by Build.
-// For a *redis.ClusterClient, KeyPrefix must contain a non-empty Redis hash tag;
-// Build rejects it otherwise. Configure the client to read from primaries and
-// honor context deadlines. Shutdown leaves the client open; close it after all
-// caches using it shut down.
+// UseRedisClient selects a caller-owned standalone, Sentinel, Cluster, or Ring
+// client, replacing any earlier RedisURL setting. A nil client is rejected by
+// Build. For a sharded client (*redis.ClusterClient or *redis.Ring), KeyPrefix
+// must contain a non-empty Redis hash tag; Build rejects it otherwise. Configure
+// the client to read from primaries and honor context deadlines. Shutdown leaves
+// the client open; close it after all caches using it shut down.
 func (b *Builder[K, V]) UseRedisClient(client redis.UniversalClient) *Builder[K, V] {
 	b.cfg.client = client
 	b.cfg.url = ""
@@ -166,15 +178,17 @@ func (b *Builder[K, V]) UseRedisClient(client redis.UniversalClient) *Builder[K,
 // "my-cache:hot". The default empty prefix adds neither a prefix nor a separator.
 // Prefixes are not hashed, escaped, or trimmed; "my-cache:" produces "my-cache::".
 //
-// A namespace is intentionally pinned to one Redis Cluster hash slot: values,
-// locks, permits, the hot and due indexes, refresh pacing, and the events channel
-// all derive from the prefix, and the Lua scripts address several of them in one
-// call, so Redis requires them to share a slot. Standalone Redis and Sentinel need
-// no tag. For Redis Cluster, include a non-empty Redis hash tag in the prefix
-// yourself (for example, "my-cache:{products}"); Redis hashes the content between
-// the first "{" and the first "}" after it and ignores later pairs. Build rejects
-// an injected *redis.ClusterClient whose KeyPrefix has no non-empty tag, since the
-// namespace would otherwise fail with CROSSSLOT at the first read.
+// A namespace is intentionally pinned to one shard: values, locks, permits, the
+// hot and due indexes, refresh pacing, and the events channel all derive from the
+// prefix, and the Lua scripts address several of them in one call, so every
+// namespace key must land on one Redis Cluster slot or Redis Ring shard.
+// Standalone Redis and Sentinel need no tag. For a sharded client, include a
+// non-empty Redis hash tag in the prefix yourself (for example,
+// "my-cache:{products}"); both Redis Cluster and Redis Ring hash only the content
+// between the first "{" and the first "}" after it and ignore later pairs. Build
+// rejects an injected *redis.ClusterClient or *redis.Ring whose KeyPrefix has no
+// non-empty tag: Redis Cluster would fail with CROSSSLOT at the first read, and
+// Redis Ring would silently split coordination across shards.
 //
 // All replicas in a namespace must agree on configuration, key/value types,
 // serialization, and fetch semantics. Use separate namespaces for unrelated data.
