@@ -238,9 +238,11 @@ scheduler polling is at most every 100 ms.
 `cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest sampled
 access first. Because hotness is sampled, eligibility can end up to one sample
 window earlier than an exact last-read window would, and the reported order can
-lag by up to the same bound. It returns `nil` when refresh is disabled or the
-cache, context, or Redis is unavailable. Its slice-only signature cannot
-distinguish an unavailable result from an empty set.
+lag by up to the same bound. A `nil` result means the answer is unavailable:
+refresh is disabled, the cache is closed, the context is canceled, or Redis
+failed. A non-nil empty slice means the query succeeded and no keys are currently
+eligible. The slice-only signature carries no error, so compare against `nil`;
+`len(result) == 0` conflates the two cases.
 
 ## Coordination and recovery
 

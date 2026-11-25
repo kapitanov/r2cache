@@ -860,6 +860,17 @@ func TestIntegration(t *testing.T) {
 		require.ErrorIs(t, admin.ZScore(ctx, limitedKeys[2], "stale").Err(), redis.Nil, "limited acquire did not prune permits")
 	})
 
+	t.Run("hot keys nil versus empty", func(t *testing.T) {
+		policy := AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(policy))
+		// No reads yet: the query succeeds, so the empty result must be non-nil.
+		keys := c.HotKeys(ctx)
+		require.NotNil(t, keys, "successful empty result must not be nil")
+		require.Empty(t, keys)
+		disabled := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+"-disabled").Fetch(func(context.Context, string) (int, error) { return 1, nil }))
+		require.Nil(t, disabled.HotKeys(ctx), "disabled refresh must return nil")
+	})
+
 	t.Run("refresh and foreground share permits", func(t *testing.T) {
 		var active, peak, calls atomic.Int64
 		fetch := func(ctx context.Context, _ string) (int, error) {
