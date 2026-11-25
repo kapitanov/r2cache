@@ -1146,7 +1146,10 @@ func TestIntegration(t *testing.T) {
 
 	t.Run("shutdown and caller owned client", func(t *testing.T) {
 		client := redis.NewClient(options)
-		defer func() { _ = client.Close() }()
+		// Cleanups are LIFO, so this Close runs after the cache Shutdown
+		// registered below: cache first, caller-owned client second, on every
+		// path including early failure.
+		t.Cleanup(func() { _ = client.Close() })
 		entered := make(chan struct{})
 		c, err := NewBuilder[string, int]().
 			UseRedisClient(client).
