@@ -141,6 +141,32 @@ func TestBuilderCorrectionsAndOverrides(t *testing.T) {
 	require.Equal(t, "redis://localhost:6379", builder.cfg.url)
 }
 
+// Build parses the RedisURL from the builder's current state on every call, so
+// reuse after changing the URL must not reuse parsed options from an earlier build.
+func TestBuilderRedisURLReuse(t *testing.T) {
+	builder := NewBuilder[string, int]().
+		RedisURL("redis://localhost:6379").
+		Fetch(func(context.Context, string) (int, error) { return 1, nil })
+
+	first, err := builder.Build()
+	require.NoError(t, err)
+	defer first.Shutdown()
+	require.True(t, first.owned)
+	require.Equal(t, "localhost:6379", first.cfg.options.Addr)
+
+	builder.RedisURL("http://localhost")
+	_, err = builder.Build()
+	require.ErrorContains(t, err, "invalid URL scheme")
+
+	builder.RedisURL("redis://localhost:6380")
+	second, err := builder.Build()
+	require.NoError(t, err)
+	defer second.Shutdown()
+	require.True(t, second.owned)
+	require.Equal(t, "localhost:6380", second.cfg.options.Addr)
+	require.NotSame(t, first.client, second.client)
+}
+
 func TestJSONSerializer(t *testing.T) {
 	type value struct {
 		Name  string

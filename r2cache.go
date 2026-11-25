@@ -61,16 +61,11 @@ type Cache[K ~string, V any] struct {
 }
 
 // newCache starts workers only after Builder.Build has validated and copied settings.
+// When the cache owns its client, Build has already parsed cfg.options.
 func newCache[K ~string, V any](cfg config[K, V]) (*Cache[K, V], error) {
 	owned := cfg.client == nil
 	if owned {
-		options, err := redis.ParseURL(cfg.url)
-		if err != nil {
-			return nil, err
-		}
-
-		options.ContextTimeoutEnabled = true
-		cfg.client = redis.NewClient(options)
+		cfg.client = redis.NewClient(cfg.options)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,6 +131,9 @@ func (c *Cache[K, V]) begin(ctx context.Context) (context.Context, func(), error
 	return op, stopFunc, nil
 }
 
+// decode unmarshals a stored value. Serializer.Unmarshal takes []byte, so the
+// conversion below copies the Redis string once per call; the copy is inherent
+// to that interface and is not worth a second, string-accepting serializer API.
 func (c *Cache[K, V]) decode(data string) (V, error) {
 	var value V
 	err := c.cfg.serializer.Unmarshal([]byte(data), &value)
@@ -221,7 +219,7 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 		// during the attempt still causes an immediate retry.
 		signal, release := c.waitFor(key)
 
-		value, finished, err := c.attempt(ctx, key, false)
+		value, finished, err := c.attempt(ctx, key, keys, false)
 		if err != nil || finished {
 			release()
 			return value, err
@@ -242,9 +240,16 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 	}
 }
 
-func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool, error) {
+// attempt makes one acquisition attempt for key. keys must be c.keys(key); the
+// polling path already built it for the initial read, so it is passed in rather
+// than rebuilt on every poll.
+//
+// The token stays per attempt instead of being hoisted across polls: it
+// identifies one acquisition. An acquire can reach Redis and be applied even
+// when its reply is lost, so reusing a token on the next poll would make the
+// ownership of an already-written lease, and its later release, ambiguous.
+func (c *Cache[K, V]) attempt(ctx context.Context, key K, keys []string, refresh bool) (V, bool, error) {
 	var zero V
-	keys := c.keys(key)
 	token := rand.Text()
 	mode := 0
 	if refresh {
