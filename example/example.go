@@ -133,7 +133,9 @@ func main() {
 	}
 
 	flag.StringVar(&cfg.redisURL, "redis-url", url, "Redis URL, defaults to REDIS_URL or redis://localhost:6379/0")
-	flag.StringVar(&cfg.prefix, "prefix", "", "unused cache namespace, defaults to a unique namespace for this run")
+	flag.StringVar(&cfg.prefix, "prefix", "",
+		"cache namespace prefix; defaults to a unique namespace for this run.\n"+
+			"Use a namespace not used by earlier runs so cached snapshots do not affect the demonstration.")
 	flag.IntVar(&cfg.readers, "readers", 12, "number of simultaneous reads in the singleflight demonstration")
 	flag.DurationVar(&cfg.latency, "backend-latency", 150*time.Millisecond, "simulated backend latency, between 30ms and 1s")
 	flag.Parse()
