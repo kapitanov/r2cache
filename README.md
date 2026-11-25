@@ -232,8 +232,9 @@ Refresh timing is best-effort: slow backends, busy permits, and scheduler pollin
 can delay work. After a failed refresh, that key's due time is set to the failure
 time plus `UpdateInterval`, so a fetch slower than the interval cannot trigger an
 almost immediate retry. Busy attempts and keys that are no longer hot are not
-deferred this way. An existing value remains only until its original TTL. Idle
-scheduler polling is at most every 100 ms.
+deferred this way. An existing value remains only until its original TTL. When
+nothing is due, the scheduler polls no faster than the configured interval and
+never sleeps longer than one second.
 
 `cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest sampled
 access first. Because hotness is sampled, eligibility can end up to one sample
