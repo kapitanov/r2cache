@@ -891,10 +891,12 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("bounded hot keys", func(t *testing.T) {
-		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}))
 		seeded := make([]string, 5)
 		for i := range seeded {
 			seeded[i] = fmt.Sprintf("key-%d", i)
+			require.Equal(t, 1, mustGet(t, c, seeded[i]))
+			// A miss does not mark a key hot, so read twice to record a hit.
 			require.Equal(t, 1, mustGet(t, c, seeded[i]))
 		}
 
@@ -922,7 +924,7 @@ func TestIntegration(t *testing.T) {
 		require.Nil(t, keys, "limit 0")
 		require.False(t, truncated, "limit 0")
 
-		empty := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":empty").Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		empty := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":empty").Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}))
 		keys, truncated = empty.HotKeysLimit(ctx, 3)
 		require.NotNil(t, keys, "empty result must be non-nil")
 		require.Empty(t, keys, "empty namespace")
@@ -934,7 +936,7 @@ func TestIntegration(t *testing.T) {
 		require.False(t, truncated, "closed cache")
 
 		client := redis.NewClient(options)
-		broken := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":broken").Fetch(func(context.Context, string) (int, error) { return 1, nil }).UseRedisClient(client).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}))
+		broken := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()+":broken").Fetch(func(context.Context, string) (int, error) { return 1, nil }).UseRedisClient(client).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}))
 		require.NoError(t, client.Close())
 		keys, truncated = broken.HotKeysLimit(ctx, 2)
 		require.Nil(t, keys, "Redis failure")
