@@ -223,8 +223,8 @@ from an empty set.
 ## Coordination and recovery
 
 Atomic Lua scripts acquire per-key leases and optional global permits, renew them,
-and check ownership before storing a result. Waiters use Pub/Sub notifications
-with a 100 ms polling fallback for missed signals and abandoned leases.
+and check ownership before storing a result. Waiters use per-key Pub/Sub
+notifications with a 100 ms polling fallback for missed signals and abandoned leases.
 
 Leases renew every third of their duration. A process pause, network partition,
 or Redis failover can allow recovery to overlap an old backend call. That can

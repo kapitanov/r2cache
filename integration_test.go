@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +36,144 @@ func mustGet(t *testing.T, c *Cache[string, int], key string) int {
 	value, err := c.GetOrFetch(ctx, key)
 	require.NoError(t, err)
 	return value
+}
+
+// wakeWindow bounds how long a notification-triggered attempt may take. It must
+// stay below the 100ms polling interval, otherwise an attempt could be explained
+// by the backstop timer instead of the notification.
+const wakeWindow = 80 * time.Millisecond
+
+// acquireGate is a go-redis Hook that counts acquire-script invocations per user
+// key and can hold them before they reach Redis. Holding attempts keeps waiters
+// registered while other keys are notified, so the test observes wakeups rather
+// than the polling backstop.
+type acquireGate struct {
+	mu      sync.Mutex
+	labels  map[string]string
+	gates   map[string]chan struct{}
+	waiting map[string]int
+	counts  map[string]int
+}
+
+func newAcquireGate() *acquireGate {
+	return &acquireGate{
+		labels:  make(map[string]string),
+		gates:   make(map[string]chan struct{}),
+		waiting: make(map[string]int),
+		counts:  make(map[string]int),
+	}
+}
+
+func (g *acquireGate) register(lockKey, label string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.labels[lockKey] = label
+}
+
+func (g *acquireGate) hold(label string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.gates[label] == nil {
+		g.gates[label] = make(chan struct{})
+	}
+}
+
+func (g *acquireGate) release(label string) {
+	g.mu.Lock()
+	gate := g.gates[label]
+	g.gates[label] = nil
+	g.mu.Unlock()
+	if gate != nil {
+		close(gate)
+	}
+}
+
+func (g *acquireGate) attempts(label string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.counts[label]
+}
+
+func (g *acquireGate) blocked(label string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.waiting[label]
+}
+
+func (g *acquireGate) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (g *acquireGate) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		if len(args) < 5 || !strings.EqualFold(fmt.Sprint(args[0]), "evalsha") || fmt.Sprint(args[1]) != acquireScript.Hash() {
+			return next(ctx, cmd)
+		}
+
+		g.mu.Lock()
+		label, known := g.labels[fmt.Sprint(args[4])]
+		if !known {
+			g.mu.Unlock()
+			return next(ctx, cmd)
+		}
+		gate := g.gates[label]
+		if gate == nil {
+			g.counts[label]++
+			g.mu.Unlock()
+			return next(ctx, cmd)
+		}
+		g.waiting[label]++
+		g.mu.Unlock()
+
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			g.mu.Lock()
+			g.waiting[label]--
+			g.mu.Unlock()
+			return ctx.Err()
+		}
+
+		g.mu.Lock()
+		g.waiting[label]--
+		g.counts[label]++
+		g.mu.Unlock()
+
+		return next(ctx, cmd)
+	}
+}
+
+func (g *acquireGate) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func testCacheWithGate(t *testing.T, options *redis.Options, prefix string) (*Cache[string, int], *acquireGate) {
+	t.Helper()
+	gate := newAcquireGate()
+	client := redis.NewClient(options)
+	client.AddHook(gate)
+	t.Cleanup(func() { _ = client.Close() })
+	c, err := NewBuilder[string, int]().
+		UseRedisClient(client).
+		KeyPrefix(prefix).
+		Fetch(func(context.Context, string) (int, error) { return 1, nil }).
+		Build()
+	require.NoError(t, err)
+	t.Cleanup(c.Shutdown)
+	return c, gate
+}
+
+func waitForSubscribers(t *testing.T, admin *redis.Client, channel string) {
+	t.Helper()
+	eventually(t, 2*time.Second, func() bool {
+		counts, err := admin.PubSubNumSub(context.Background(), channel).Result()
+		return err == nil && counts[channel] >= 1
+	})
+}
+
+func waiterCount(c *Cache[string, int]) int {
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+	return len(c.waiters)
 }
 
 func TestIntegration(t *testing.T) {
@@ -332,6 +471,88 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, <-done)
 		require.Equal(t, 8, mustGet(t, b, "key"))
 		require.Equal(t, int64(1), calls.Load(), "waiter disturbed owner")
+	})
+
+	// A notification must wake only the waiters registered for its key. Both
+	// waiters share one cache and one notifications worker, so the waiter that is
+	// expected to stay asleep shares the goroutine that consumes the A event.
+	t.Run("notification wakes only waiters for its key", func(t *testing.T) {
+		c, gate := testCacheWithGate(t, options, t.Name())
+		waitForSubscribers(t, admin, c.base+"events")
+		gate.register(c.keys("A")[1], "A")
+		gate.register(c.keys("B")[1], "B")
+		for _, key := range []string{"A", "B"} {
+			require.NoError(t, admin.Set(ctx, c.keys(key)[1], "owner", time.Minute).Err())
+		}
+
+		gate.hold("A")
+		gate.hold("B")
+		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		t.Cleanup(cancel)
+		done := make(chan error, 2)
+		for _, key := range []string{"A", "B"} {
+			go func() {
+				_, err := c.GetOrFetch(waitCtx, key)
+				done <- err
+			}()
+		}
+		eventually(t, time.Second, func() bool { return gate.blocked("A") == 1 && gate.blocked("B") == 1 })
+		require.Zero(t, gate.attempts("A"))
+		require.Zero(t, gate.attempts("B"))
+
+		require.NoError(t, admin.Publish(ctx, c.base+"events", "A").Err())
+		gate.release("A")
+		eventually(t, wakeWindow, func() bool { return gate.attempts("A") >= 2 })
+
+		gate.release("B")
+		eventually(t, time.Second, func() bool { return gate.attempts("B") >= 1 })
+		require.Never(t, func() bool { return gate.attempts("B") > 1 }, 50*time.Millisecond, 5*time.Millisecond,
+			"event for A woke the waiter for B")
+
+		// The waiter for B must still wake for its own key.
+		gate.hold("B")
+		eventually(t, time.Second, func() bool { return gate.blocked("B") >= 1 })
+		before := gate.attempts("B")
+		require.NoError(t, admin.Publish(ctx, c.base+"events", "B").Err())
+		gate.release("B")
+		eventually(t, wakeWindow, func() bool { return gate.attempts("B") >= before+2 })
+
+		cancel()
+		for range 2 {
+			require.ErrorIs(t, <-done, context.Canceled)
+		}
+		eventually(t, time.Second, func() bool { return waiterCount(c) == 0 })
+	})
+
+	// One publish must wake every waiter registered for that key.
+	t.Run("notification wakes all waiters for its key", func(t *testing.T) {
+		c, gate := testCacheWithGate(t, options, t.Name())
+		waitForSubscribers(t, admin, c.base+"events")
+		gate.register(c.keys("A")[1], "A")
+		require.NoError(t, admin.Set(ctx, c.keys("A")[1], "owner", time.Minute).Err())
+
+		gate.hold("A")
+		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		t.Cleanup(cancel)
+		done := make(chan error, 2)
+		for range 2 {
+			go func() {
+				_, err := c.GetOrFetch(waitCtx, "A")
+				done <- err
+			}()
+		}
+		eventually(t, time.Second, func() bool { return gate.blocked("A") == 2 })
+		require.Zero(t, gate.attempts("A"))
+
+		require.NoError(t, admin.Publish(ctx, c.base+"events", "A").Err())
+		gate.release("A")
+		eventually(t, wakeWindow, func() bool { return gate.attempts("A") >= 4 })
+
+		cancel()
+		for range 2 {
+			require.ErrorIs(t, <-done, context.Canceled)
+		}
+		eventually(t, time.Second, func() bool { return waiterCount(c) == 0 })
 	})
 
 	t.Run("abandoned lock and permit expire", func(t *testing.T) {
