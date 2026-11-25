@@ -865,10 +865,76 @@ func TestIntegration(t *testing.T) {
 		mustGet(t, c, "key")
 		select {
 		case m := <-received:
-			require.Equal(t, MetricValues{HitCount: 1, MissCount: 1, BackendFetchCount: 1, HotKeyCount: 1}, m)
+			require.Equal(t, MetricValues{HitCount: 1, MissCount: 1, BackendFetchCount: 1, DecodeErrorCount: 0, HotKeyCount: 1}, m)
 		case <-time.After(3 * time.Second):
 			require.FailNow(t, "no metrics")
 		}
+	})
+
+	t.Run("decode errors invalidate corrupt values", func(t *testing.T) {
+		for _, tt := range []struct {
+			name    string
+			refresh bool
+		}{
+			{name: "auto refresh off"},
+			{name: "auto refresh on", refresh: true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				var calls atomic.Int64
+				builder := NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).
+					Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 42, nil }).
+					UseSerializer(corruptSerializer{})
+				if tt.refresh {
+					builder.EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour})
+				}
+				c := testCache(t, builder)
+				valueKey := c.keys("key")[0]
+				require.NoError(t, admin.Set(ctx, valueKey, corruptPayload, time.Minute).Err())
+
+				_, err := c.GetOrFetch(ctx, "key")
+				require.ErrorContains(t, err, "decode")
+				require.Zero(t, admin.Exists(ctx, valueKey).Val(), "corrupt value survived")
+				require.Zero(t, calls.Load(), "corrupt hit reached the backend")
+
+				value, err := c.GetOrFetch(ctx, "key")
+				require.NoError(t, err)
+				require.Equal(t, 42, value)
+				require.Equal(t, int64(1), calls.Load(), "corrupt value was not rebuilt")
+				stored, err := admin.Get(ctx, valueKey).Result()
+				require.NoError(t, err)
+				require.Equal(t, "42", stored, "valid value not stored")
+			})
+		}
+	})
+
+	t.Run("decode error metrics", func(t *testing.T) {
+		received := make(chan MetricValues, 4)
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).
+			Fetch(func(context.Context, string) (int, error) { return 42, nil }).
+			UseSerializer(corruptSerializer{}).
+			MetricsReceiver(func(m MetricValues) { received <- m }))
+		require.NoError(t, admin.Set(ctx, c.keys("key")[0], corruptPayload, time.Minute).Err())
+		_, err := c.GetOrFetch(ctx, "key")
+		require.ErrorContains(t, err, "decode")
+		select {
+		case m := <-received:
+			require.Equal(t, MetricValues{HitCount: 1, DecodeErrorCount: 1}, m)
+		case <-time.After(3 * time.Second):
+			require.FailNow(t, "no metrics")
+		}
+	})
+
+	t.Run("compare and delete preserves replacement", func(t *testing.T) {
+		valueKey := t.Name() + ":value"
+		require.NoError(t, admin.Set(ctx, valueKey, "fresh", time.Minute).Err())
+		deleted, err := deleteValueScript.Run(ctx, admin, []string{valueKey}, corruptPayload).Int()
+		require.NoError(t, err)
+		require.Zero(t, deleted, "deleted a replacement")
+		require.Equal(t, "fresh", admin.Get(ctx, valueKey).Val())
+		deleted, err = deleteValueScript.Run(ctx, admin, []string{valueKey}, "fresh").Int()
+		require.NoError(t, err)
+		require.Equal(t, 1, deleted, "did not delete matching value")
+		require.Zero(t, admin.Exists(ctx, valueKey).Val())
 	})
 
 	t.Run("shared refresh pacing", func(t *testing.T) {
@@ -1046,7 +1112,21 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, admin.Set(ctx, broken.keys("key")[0], "corrupt", time.Second).Err())
 		_, err = broken.GetOrFetch(ctx, "key")
 		require.Error(t, err, "decode error lost")
+		require.Zero(t, admin.Exists(ctx, broken.keys("key")[0]).Val(), "undecodable value not invalidated")
 	})
+}
+
+const corruptPayload = "corrupt"
+
+type corruptSerializer struct{}
+
+func (corruptSerializer) Marshal(v int) ([]byte, error) { return []byte(fmt.Sprint(v)), nil }
+func (corruptSerializer) Unmarshal(data []byte, v *int) error {
+	if string(data) == corruptPayload {
+		return errors.New("corrupt value")
+	}
+	_, err := fmt.Sscan(string(data), v)
+	return err
 }
 
 type integerSerializer struct{}

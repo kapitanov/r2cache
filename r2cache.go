@@ -21,9 +21,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// cleanupTimeout bounds best-effort lock and permit releases run after an acquire
-// failure or a completed fetch. They use a fresh context because the caller's
-// context may already be canceled.
+// cleanupTimeout bounds best-effort lock and permit releases and undecodable
+// value invalidation. They use a fresh context because the caller's context may
+// already be canceled.
 const cleanupTimeout = 2 * time.Second
 
 // ErrClosed is returned by GetOrFetch when Shutdown has already begun. Operations
@@ -56,6 +56,7 @@ type Cache[K ~string, V any] struct {
 	waitMu                sync.Mutex
 	waiters               map[string]*wakeup
 	hits, misses, fetches atomic.Int64
+	decodeErrors          atomic.Int64
 }
 
 // newCache starts workers only after Builder.Build has validated and copied settings.
@@ -144,11 +145,34 @@ func (c *Cache[K, V]) decode(data string) (V, error) {
 	return value, nil
 }
 
+// decodeCached decodes a stored value and, on failure, deletes the exact bytes
+// that failed to decode. The delete uses a fresh context so caller cancellation
+// cannot skip the repair, and the compare keeps a concurrent replacement intact.
+func (c *Cache[K, V]) decodeCached(valueKey, data string) (V, error) {
+	value, err := c.decode(data)
+	if err == nil {
+		return value, nil
+	}
+
+	c.decodeErrors.Add(1)
+
+	op, stop := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer stop()
+
+	// The decode error is the caller-visible failure; a failed cleanup only
+	// leaves the corrupt value for a later read to invalidate.
+	_ = deleteValueScript.Run(op, c.client, []string{valueKey}, data).Err()
+
+	return value, err
+}
+
 // GetOrFetch returns an unexpired cached value, or waits for ownership to fetch
 // and store one. Concurrent readers across replicas share a successful fetch;
 // a reader may retry acquisition after another owner's fetch fails. Failed
 // fetches are not cached, and Redis errors do not bypass coordination to call
-// the backend. A decoding error is returned without replacing the stored value.
+// the backend. A decoding error deletes the stored bytes when they still match
+// the undecodable value, returns the error, and leaves a concurrent replacement
+// untouched; the next read fetches and stores a new value.
 //
 // With auto-refresh enabled, an initial lookup that finds a stored value records
 // this external access; a cache miss does not. A key fetched after a miss becomes
@@ -179,7 +203,7 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 	data, err := readScript.Run(ctx, c.client, []string{keys[0], keys[3]}, string(key), hot, interval).Text()
 	if err == nil {
 		c.hits.Add(1)
-		return c.decode(data)
+		return c.decodeCached(keys[0], data)
 	}
 
 	if !errors.Is(err, redis.Nil) {
@@ -270,7 +294,7 @@ func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool
 			return zero, false, errors.New("r2cache: invalid cached value")
 		}
 
-		v, e := c.decode(data)
+		v, e := c.decodeCached(keys[0], data)
 		return v, true, e
 
 	case 2:
