@@ -384,9 +384,11 @@ func (c *Cache[K, V]) renew(ctx context.Context, cancel context.CancelCauseFunc,
 // 1ms. Sampling never extends eligibility beyond an exact last-read window: it
 // can expire up to one window earlier, and the reported access order can lag by
 // up to one window. Within that bound, eligibility is best-effort, not an exact
-// read trace. HotKeys returns nil when refresh is disabled, the cache is closed,
-// the context is canceled, or Redis fails. Errors cannot be distinguished from
-// an empty result through this slice-only API.
+// read trace. A nil result means the answer is unavailable: refresh is disabled,
+// the cache is closed, the context is canceled, or Redis failed. A non-nil empty
+// slice means the query succeeded and no keys are currently eligible. The
+// signature has no error return, so compare against nil to tell the two cases
+// apart; len(result) == 0 conflates them.
 // The result covers the shared namespace, not just this instance's reads. Calling
 // HotKeys neither fetches values nor extends their hot-key eligibility.
 func (c *Cache[K, V]) HotKeys(ctx context.Context) []K {
@@ -406,6 +408,8 @@ func (c *Cache[K, V]) HotKeys(ctx context.Context) []K {
 		return nil
 	}
 
+	// make returns a non-nil slice even for zero length, so a successful query
+	// never returns nil; nil is reserved for the unavailable cases above.
 	result := make([]K, len(keys))
 	for i, key := range keys {
 		result[i] = K(key)
