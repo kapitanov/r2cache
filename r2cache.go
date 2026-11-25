@@ -150,8 +150,9 @@ func (c *Cache[K, V]) decode(data string) (V, error) {
 // fetches are not cached, and Redis errors do not bypass coordination to call
 // the backend. A decoding error is returned without replacing the stored value.
 //
-// With auto-refresh enabled, the initial lookup records this external access,
-// even on a cache miss; background refreshes do not extend that access window.
+// With auto-refresh enabled, an initial lookup that finds a stored value records
+// this external access; a cache miss does not. A key fetched after a miss becomes
+// hot on a later read that hits. Background refreshes do not extend that window.
 // The context bounds waiting and is passed to a callback owned by this call.
 // Canceling a waiter does not cancel another reader's fetch. Fetchers must honor
 // cancellation: the owning call waits for its callback to return before completing.
