@@ -327,9 +327,10 @@ func TestIntegration(t *testing.T) {
 
 	t.Run("refresh reads sample hotness", func(t *testing.T) {
 		var calls atomic.Int64
-		policy := AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: 10 * time.Second}
+		// Keep UpdateInterval below both HotKeyLifetime and TTL for issue #5.
+		policy := AutoRefreshPolicy{HotKeyLifetime: 10 * time.Second, UpdateInterval: 2 * time.Second}
 		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).TTL(time.Minute).
-			Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }).
+			Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }).
 			EnableAutoRefresh(policy))
 		keys := c.keys("key")
 
@@ -362,6 +363,12 @@ func TestIntegration(t *testing.T) {
 			now, err := admin.Time(ctx).Result()
 			return err == nil && float64(now.UnixMilli()) >= lastAccess+float64(sample.Milliseconds())
 		})
+		// The due entry from the first commit fires during the window. A
+		// background refresh replaces the value but must not touch the hot score.
+		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
+		indexed, err := admin.ZScore(ctx, keys[3], "key").Result()
+		require.NoError(t, err)
+		require.InDelta(t, hotBefore, indexed, 0, "background refresh wrote the hot score")
 		require.Equal(t, 1, mustGet(t, c, "key"), "hit after the sample window")
 		hotLater, err := admin.ZScore(ctx, keys[3], "key").Result()
 		require.NoError(t, err)
