@@ -362,26 +362,106 @@ func (c *Cache[K, V]) fetch(ctx context.Context, key K, keys []string, token str
 	return value, nil
 }
 
+// renew keeps the fetch lease alive until ctx is done. The two renewal outcomes
+// are not equivalent: renew.lua returning 0 means this token no longer owns the
+// lock, so the fetch is canceled immediately, while failing to reach Redis says
+// nothing about ownership and is retried with a short backoff. The goroutine
+// starts immediately after a successful acquire, whose lease runs until one
+// lease from now; every confirmed renewal pushes that deadline forward.
 func (c *Cache[K, V]) renew(ctx context.Context, cancel context.CancelCauseFunc, keys []string, token string) {
-	ticker := time.NewTicker(c.cfg.lease / 3)
-	defer ticker.Stop()
+	lease := c.cfg.lease
+	interval := lease / 3
+
+	// deadline is the last confirmed lease expiry, not the wall clock. A failed
+	// renewal only means the lease was not extended yet, so a transient error
+	// remains recoverable until this deadline.
+	deadline := time.Now().Add(lease)
+
+	// safetyMargin keeps one full renewal interval in hand. Continuing to retry
+	// requires now+safetyMargin < deadline, and each attempt is bounded by
+	// interval, so an attempt cannot run past the deadline. The same interval is
+	// also the cancellation lead time: when the lease gets too close, the
+	// callback learns immediately instead of after server-side expiry.
+	safetyMargin := interval
+
+	// retryBackoff spaces transport-failure retries. A quarter of the renewal
+	// interval is short enough for several attempts before the deadline, while
+	// the floor prevents a busy loop on the minimum 100ms lease and the cap
+	// keeps a long lease responsive.
+	retryBackoff := interval / 4
+	if retryBackoff > time.Second {
+		retryBackoff = time.Second
+	}
+	if retryBackoff < 10*time.Millisecond {
+		retryBackoff = 10 * time.Millisecond
+	}
+
+	// A timer rather than a ticker: after a successful retry the next renewal is
+	// one interval from that success, exactly the normal cadence, and a queued
+	// tick cannot trigger an immediate extra renewal.
+	next := time.NewTimer(interval)
+	defer next.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-next.C:
 		}
 
-		op, stop := context.WithTimeout(ctx, c.cfg.lease/3)
-		ok, err := renewScript.Run(op, c.client, []string{keys[1], keys[2]}, token, c.cfg.lease.Milliseconds(), c.cfg.max).Int()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			if !time.Now().Add(safetyMargin).Before(deadline) {
+				cancel(ErrLeaseLost)
+				return
+			}
 
-		stop()
+			timeout := interval
+			if remaining := time.Until(deadline); remaining < timeout {
+				timeout = remaining
+			}
+			op, stop := context.WithTimeout(ctx, timeout)
+			ok, err := renewScript.Run(op, c.client, []string{keys[1], keys[2]}, token, c.cfg.lease.Milliseconds(), c.cfg.max).Int()
+			stop()
 
-		if err != nil || ok != 1 {
-			cancel(ErrLeaseLost)
-			return
+			// Caller cancellation and shutdown are not lease loss. The parent
+			// context wins the cause, so do not claim ErrLeaseLost over it.
+			if ctx.Err() != nil {
+				return
+			}
+			if err == nil {
+				if ok != 1 {
+					cancel(ErrLeaseLost)
+					return
+				}
+				deadline = time.Now().Add(lease)
+				break
+			}
+
+			// Transport or attempt timeout: ownership is unknown, not lost.
+			// Retry after a bounded pause, but sleep no later than the point
+			// where another attempt would be refused. Otherwise a slow attempt
+			// could push the cancellation past the deadline.
+			wait := retryBackoff
+			if remaining := deadline.Sub(time.Now().Add(safetyMargin)); remaining < wait {
+				wait = remaining
+			}
+			if wait <= 0 {
+				cancel(ErrLeaseLost)
+				return
+			}
+			pause := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				pause.Stop()
+				return
+			case <-pause.C:
+			}
 		}
+
+		next.Reset(interval)
 	}
 }
 
