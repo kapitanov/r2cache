@@ -196,7 +196,7 @@ func TestIntegration(t *testing.T) {
 	t.Cleanup(func() { _ = admin.Close() })
 
 	t.Run("builder snapshots and independent clients", func(t *testing.T) {
-		policy := AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: time.Hour}
+		policy := AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}
 		builder := NewBuilder[string, int]().RedisURL(url).
 			KeyPrefix(t.Name() + ":first").TTL(time.Minute).
 			Fetch(func(context.Context, string) (int, error) { return 1, nil }).EnableAutoRefresh(policy)
@@ -627,6 +627,51 @@ func TestIntegration(t *testing.T) {
 		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	})
 
+	t.Run("failed refresh backs off from failure", func(t *testing.T) {
+		const interval = 500 * time.Millisecond
+		backendErr := errors.New("backend unavailable")
+		type attempt struct{ start, end time.Time }
+		var mu sync.Mutex
+		var attempts []attempt
+		var calls atomic.Int64
+		fetch := func(ctx context.Context, _ string) (int, error) {
+			if calls.Add(1) == 1 {
+				return 1, nil
+			}
+			start := time.Now()
+			select {
+			case <-time.After(800 * time.Millisecond):
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			end := time.Now()
+			mu.Lock()
+			attempts = append(attempts, attempt{start: start, end: end})
+			mu.Unlock()
+			return 0, backendErr
+		}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).
+			EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 10 * time.Second, UpdateInterval: interval}))
+		require.Equal(t, 1, mustGet(t, c, "key"))
+		eventually(t, 4*time.Second, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(attempts) >= 2
+		})
+		mu.Lock()
+		got := append([]attempt(nil), attempts...)
+		mu.Unlock()
+		require.GreaterOrEqual(t, len(got), 2)
+		// Each failed fetch lasts longer than the interval, so without an explicit
+		// post-failure backoff the key is already due when the attempt ends and the
+		// worker retries after about one poll (100ms). The backoff must be measured
+		// from the failure, not from the attempt start.
+		for i := 1; i < len(got); i++ {
+			require.GreaterOrEqual(t, got[i].start.Sub(got[i-1].end), interval*9/10,
+				"failed refresh retried before UpdateInterval elapsed from the failure")
+		}
+	})
+
 	t.Run("refresh and foreground share permits", func(t *testing.T) {
 		var active, peak, calls atomic.Int64
 		fetch := func(ctx context.Context, _ string) (int, error) {
@@ -659,7 +704,7 @@ func TestIntegration(t *testing.T) {
 
 	t.Run("metrics", func(t *testing.T) {
 		received := make(chan MetricValues, 4)
-		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).MetricsReceiver(func(m MetricValues) { received <- m }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 5 * time.Second, UpdateInterval: 10 * time.Second}))
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).MetricsReceiver(func(m MetricValues) { received <- m }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 20 * time.Second, UpdateInterval: 10 * time.Second}))
 		mustGet(t, c, "key")
 		mustGet(t, c, "key")
 		select {
@@ -816,7 +861,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("Redis failure does not bypass coordination", func(t *testing.T) {
 		client := redis.NewClient(options)
 		var calls atomic.Int64
-		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }).UseRedisClient(client).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Second, UpdateInterval: time.Second}))
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { calls.Add(1); return 1, nil }).UseRedisClient(client).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: time.Second}))
 		require.NoError(t, client.Close())
 		_, err := c.GetOrFetch(ctx, "key")
 		require.Error(t, err, "expected Redis error")

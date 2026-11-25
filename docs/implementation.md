@@ -21,16 +21,22 @@ Implementation sequence:
    and GitHub Actions.
 
 Validation covers cache hits and TTL, named keys and arbitrary values, serializers,
-configuration rejection, builder correction and independent snapshots, cross-instance singleflight, global concurrency across
+configuration and refresh-policy rejection, builder correction and independent
+snapshots, cross-instance singleflight, global concurrency across
 keys, renewal during slow fetches, recovery and expired-owner rejection, caller
 cancellation, fetch failures, Redis client failures, hot-key aging, refresh coordination,
-metrics, and shutdown/client ownership. Integration tests must fail rather than
+failed-refresh backoff, metrics, and shutdown/client ownership. Integration tests must fail rather than
 silently skip when Docker is unavailable. `-short` explicitly runs only unit tests.
 
 Constraints: leases are best-effort under failover/partitions; all replicas sharing
-one namespace must agree on settings and fetch semantics. Refresh intervals are
-best-effort under slow backends or saturated concurrency. Callback cancellation is
-cooperative. No stale values or backend errors are cached.
+one namespace must agree on settings and fetch semantics. `UpdateInterval` must be
+strictly less than `HotKeyLifetime` and `TTL`, compared as millisecond-truncated
+values; `Build` rejects violations so a key cannot leave the hot set or expire
+before its refresh is due. A failed refresh sets that key's due time to the failure
+time plus `UpdateInterval`, measured after the attempt; busy and no-longer-hot
+attempts are not deferred. Refresh timing is otherwise best-effort under slow
+backends or saturated concurrency. Callback cancellation is cooperative. No stale
+values or backend errors are cached.
 
 ## Completed validation
 

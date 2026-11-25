@@ -209,11 +209,18 @@ approximately `UpdateInterval / hot-key-count`; each replica runs one background
 fetch worker. Foreground fetches and refreshes share the same leases and
 concurrency limit.
 
-Both policy durations must be at least 1 ms. Intervals are best-effort: slow
-backends, busy permits, and scheduler polling can delay work. Failed or busy
-refreshes are retried on a later interval, while an existing value remains only
-until its original TTL. Set the refresh interval below the TTL with room for
-backend latency. Idle scheduler polling is at most every 100 ms.
+Both policy durations must be at least 1 ms and are truncated to whole
+milliseconds. `Build` rejects a policy whose `UpdateInterval` is greater than or
+equal to `HotKeyLifetime` or to the cache `TTL`: the hot entry would leave the
+index before the refresh is due, or the value would expire first. Keep the
+interval strictly below both, with room for backend latency.
+
+Refresh timing is best-effort: slow backends, busy permits, and scheduler polling
+can delay work. After a failed refresh, that key's due time is set to the failure
+time plus `UpdateInterval`, so a fetch slower than the interval cannot trigger an
+almost immediate retry. Busy attempts and keys that are no longer hot are not
+deferred this way. An existing value remains only until its original TTL. Idle
+scheduler polling is at most every 100 ms.
 
 `cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest access
 first. It returns `nil` when refresh is disabled or the cache, context, or Redis
