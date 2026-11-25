@@ -246,8 +246,9 @@ type Serializer[V any] interface {
 	Marshal(V) ([]byte, error)
 
 	// Unmarshal decodes a stored value into the non-nil destination supplied by
-	// the cache. An error is returned to the reader without fetching a replacement;
-	// the stored bytes remain until expiry or external removal.
+	// the cache. An error is returned to the reader after the cache deletes the
+	// stored bytes when they still match the input; a replacement written after
+	// the failed read survives, and the next read fetches a new value.
 	Unmarshal([]byte, *V) error
 }
 
@@ -289,6 +290,11 @@ type MetricValues struct {
 	// BackendFetchCount counts local callback invocations, including background
 	// refreshes and calls that fail or are canceled.
 	BackendFetchCount int64
+
+	// DecodeErrorCount counts stored values that failed to decode on a cache hit.
+	// Each error deletes the exact bytes that failed to decode when they are still
+	// stored, so a value written by a concurrent refresh or another replica survives.
+	DecodeErrorCount int64
 
 	// HotKeyCount is the current number of eligible hot keys across the namespace,
 	// based on sampled hotness. It is zero when refresh is disabled and -1 if Redis

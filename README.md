@@ -136,8 +136,10 @@ writes and refreshes start a new TTL. Backend errors are not cached or shared as
 results, so a waiter may retry after a failed owner releases its lease.
 
 Redis and serialization errors are returned to the caller. Redis failures do not
-trigger uncoordinated backend calls. A value that fails to decode remains in Redis
-until expiry or external removal.
+trigger uncoordinated backend calls. A value that fails to decode is deleted when
+it still matches the bytes that failed to decode, and the next read fetches a
+replacement; the compare preserves a value written by a concurrent refresh or
+another replica after the failed read.
 
 ## Configuration
 
@@ -182,6 +184,9 @@ type Serializer[V any] interface {
 
 Pass it with `builder.UseSerializer(serializer)`. Its methods must be safe for
 concurrent use. Use a new namespace when introducing an incompatible encoding.
+An `Unmarshal` error is returned to the reader after the cache deletes the bytes
+that failed to decode, provided they are still stored: a value written after the
+failed read survives, and the next read fetches a replacement.
 
 ## Automatic refresh
 
@@ -318,6 +323,7 @@ Register a callback with `builder.MetricsReceiver(receiver)`. It receives a
 | `HitCount`          | Local, cumulative | Initial reads that found a value, including decoding failures.        |
 | `MissCount`         | Local, cumulative | Initial reads that found no value, including waiters.                 |
 | `BackendFetchCount` | Local, cumulative | Fetch callback invocations, including refreshes and failures.         |
+| `DecodeErrorCount`  | Local, cumulative | Cached values that failed to decode and were invalidated if unchanged. |
 | `HotKeyCount`       | Global, current   | Sampled eligible hot keys; `0` when refresh is disabled, `-1` if unavailable. |
 
 Counters start at zero per cache and do not reset after delivery. Redis lookup

@@ -159,6 +159,6 @@ func (c *Cache[K, V]) metrics() {
 			return
 		}
 
-		c.cfg.metrics(MetricValues{HitCount: c.hits.Load(), MissCount: c.misses.Load(), BackendFetchCount: c.fetches.Load(), HotKeyCount: count})
+		c.cfg.metrics(MetricValues{HitCount: c.hits.Load(), MissCount: c.misses.Load(), BackendFetchCount: c.fetches.Load(), DecodeErrorCount: c.decodeErrors.Load(), HotKeyCount: count})
 	}
 }

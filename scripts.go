@@ -34,6 +34,11 @@ var (
 
 	releaseScript = redis.NewScript(releaseSource)
 
+	//go:embed scripts/delete_value.lua
+	deleteValueSource string
+
+	deleteValueScript = redis.NewScript(deleteValueSource)
+
 	//go:embed scripts/hot_keys.lua
 	hotKeysSource string
 
