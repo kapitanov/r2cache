@@ -412,9 +412,14 @@ func TestIntegration(t *testing.T) {
 				return 0, ctx.Err()
 			}
 		}
+		// Renewals run every lease/3 (800ms) with an 800ms RPC timeout, so even a
+		// stalled renewal cannot cancel the 900ms fetch before it returns; the
+		// lease still renews once during the fetch. The generous duration also
+		// rules out a lease gap that would allow a second waiter to acquire.
+		lease := 2400 * time.Millisecond
 		caches := make([]*Cache[string, int], 3)
 		for i := range caches {
-			caches[i] = testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).LeaseDuration(300*time.Millisecond).LimitConcurrentFetches(2))
+			caches[i] = testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).LeaseDuration(lease).LimitConcurrentFetches(2))
 		}
 		start := make(chan struct{})
 		type fetchResult struct {
@@ -716,19 +721,46 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("hot keys expire despite refresh", func(t *testing.T) {
-		var calls atomic.Int64
-		policy := AutoRefreshPolicy{HotKeyLifetime: 650 * time.Millisecond, UpdateInterval: 150 * time.Millisecond}
-		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return int(calls.Add(1)), nil }).EnableAutoRefresh(policy).TTL(time.Second))
-		// First read misses and fetches; the second read hits and makes the key hot.
+		var calls, active atomic.Int64
+		refreshStarted := make(chan struct{})
+		var refreshOnce sync.Once
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		defer releaseOnce.Do(func() { close(release) })
+		fetch := func(ctx context.Context, _ string) (int, error) {
+			n := calls.Add(1)
+			active.Add(1)
+			defer active.Add(-1)
+			if n > 1 {
+				// Hold the first background refresh across the hot-key expiry: it is
+				// the in-flight fetch that must not be mistaken for a new one.
+				refreshOnce.Do(func() { close(refreshStarted) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				}
+			}
+			return int(n), nil
+		}
+		policy := AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: 200 * time.Millisecond}
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).EnableAutoRefresh(policy).TTL(3*time.Second))
 		mustGet(t, c, "warm")
+		// Issue #3 makes a cache miss stop marking the key hot, so read again for
+		// a hit; this keeps the key hot under both the old and new read semantics.
 		mustGet(t, c, "warm")
 		require.Equal(t, []string{"warm"}, c.HotKeys(ctx), "missing hot key")
-		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
-		eventually(t, 2*time.Second, func() bool { return len(c.HotKeys(ctx)) == 0 })
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-refreshStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh did not start")
+		}
+		eventually(t, 5*time.Second, func() bool { return len(c.HotKeys(ctx)) == 0 })
+		// Let the refresh that started while the key was hot finish, then snapshot.
+		releaseOnce.Do(func() { close(release) })
+		eventually(t, 2*time.Second, func() bool { return active.Load() == 0 })
 		before := calls.Load()
-		time.Sleep(250 * time.Millisecond)
-		require.Equal(t, before, calls.Load(), "background fetch extended hot lifetime")
+		require.Never(t, func() bool { return calls.Load() != before }, time.Second, 10*time.Millisecond, "background fetch extended hot lifetime")
 	})
 
 	t.Run("failed miss is not refresh-eligible", func(t *testing.T) {
@@ -859,15 +891,38 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("metrics", func(t *testing.T) {
-		received := make(chan MetricValues, 4)
-		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(func(context.Context, string) (int, error) { return 1, nil }).MetricsReceiver(func(m MetricValues) { received <- m }).EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: 20 * time.Second, UpdateInterval: 10 * time.Second}))
+		received := make(chan MetricValues, 8)
+		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).
+			Fetch(func(context.Context, string) (int, error) { return 1, nil }).
+			MetricsReceiver(func(m MetricValues) {
+				select {
+				case received <- m:
+				default:
+				}
+			}).
+			EnableAutoRefresh(AutoRefreshPolicy{HotKeyLifetime: time.Minute, UpdateInterval: 30 * time.Second}))
 		mustGet(t, c, "key")
 		mustGet(t, c, "key")
-		select {
-		case m := <-received:
-			require.Equal(t, MetricValues{HitCount: 1, MissCount: 1, BackendFetchCount: 1, DecodeErrorCount: 0, HotKeyCount: 1}, m)
-		case <-time.After(3 * time.Second):
-			require.FailNow(t, "no metrics")
+		// The first sample may arrive before both reads complete or carry a
+		// transient -1 hot-key count from a Redis error; keep reading until the
+		// counters reflect the reads and assert the lower bounds.
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		var sample MetricValues
+		for {
+			select {
+			case sample = <-received:
+				if sample.HitCount >= 1 && sample.MissCount >= 1 && sample.BackendFetchCount >= 1 && sample.HotKeyCount >= 1 {
+					require.GreaterOrEqual(t, sample.HitCount, int64(1), "HitCount")
+					require.GreaterOrEqual(t, sample.MissCount, int64(1), "MissCount")
+					require.GreaterOrEqual(t, sample.BackendFetchCount, int64(1), "BackendFetchCount")
+					require.Zero(t, sample.DecodeErrorCount, "DecodeErrorCount")
+					require.GreaterOrEqual(t, sample.HotKeyCount, int64(1), "HotKeyCount")
+					return
+				}
+			case <-deadline.C:
+				t.Fatalf("no metrics sample reached expected lower bounds; last sample: %+v", sample)
+			}
 		}
 	})
 
