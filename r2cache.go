@@ -53,8 +53,8 @@ type Cache[K ~string, V any] struct {
 	closed                bool
 	wg                    sync.WaitGroup
 	once                  sync.Once
-	signalMu              sync.Mutex
-	signal                chan struct{}
+	waitMu                sync.Mutex
+	waiters               map[string]*wakeup
 	hits, misses, fetches atomic.Int64
 }
 
@@ -77,13 +77,13 @@ func newCache[K ~string, V any](cfg config[K, V]) (*Cache[K, V], error) {
 		base += ":"
 	}
 	c := &Cache[K, V]{
-		cfg:    cfg,
-		client: cfg.client,
-		owned:  owned,
-		base:   base,
-		ctx:    ctx,
-		cancel: cancel,
-		signal: make(chan struct{}),
+		cfg:     cfg,
+		client:  cfg.client,
+		owned:   owned,
+		base:    base,
+		ctx:     ctx,
+		cancel:  cancel,
+		waiters: make(map[string]*wakeup),
 	}
 
 	c.wg.Add(1)
@@ -190,12 +190,13 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 			return zero, err
 		}
 
-		c.signalMu.Lock()
-		signal := c.signal
-		c.signalMu.Unlock()
+		// Register for this key before attempting so a notification that arrives
+		// during the attempt still causes an immediate retry.
+		signal, release := c.waitFor(key)
 
 		value, finished, err := c.attempt(ctx, key, false)
 		if err != nil || finished {
+			release()
 			return value, err
 		}
 
@@ -204,11 +205,13 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			release()
 			return zero, ctx.Err()
 		case <-signal:
 			timer.Stop()
 		case <-timer.C:
 		}
+		release()
 	}
 }
 

@@ -5,6 +5,52 @@ import (
 	"time"
 )
 
+// wakeup groups the waiters currently registered for one key. They share a
+// channel, so one notification wakes every waiter for that key.
+type wakeup struct {
+	channel chan struct{}
+	waiters int
+}
+
+// waitFor registers the caller as a waiter for key. The returned channel is
+// closed by notify when the key changes; release must be called when the caller
+// stops waiting so an unpublished key does not retain an entry.
+func (c *Cache[K, V]) waitFor(key K) (<-chan struct{}, func()) {
+	name := string(key)
+
+	c.waitMu.Lock()
+	w := c.waiters[name]
+	if w == nil {
+		w = &wakeup{channel: make(chan struct{})}
+		c.waiters[name] = w
+	}
+	w.waiters++
+	c.waitMu.Unlock()
+
+	return w.channel, func() {
+		c.waitMu.Lock()
+		w.waiters--
+		if w.waiters == 0 && c.waiters[name] == w {
+			delete(c.waiters, name)
+		}
+		c.waitMu.Unlock()
+	}
+}
+
+// notify wakes every waiter registered for key. The entry is removed before its
+// channel is closed, which keeps each channel closed exactly once and drops keys
+// whose only event was the notification.
+func (c *Cache[K, V]) notify(key string) {
+	c.waitMu.Lock()
+	w := c.waiters[key]
+	delete(c.waiters, key)
+	c.waitMu.Unlock()
+
+	if w != nil {
+		close(w.channel)
+	}
+}
+
 func (c *Cache[K, V]) notifications() {
 	defer c.wg.Done()
 
@@ -17,15 +63,12 @@ func (c *Cache[K, V]) notifications() {
 		case <-c.ctx.Done():
 			return
 
-		case _, ok := <-messages:
+		case message, ok := <-messages:
 			if !ok {
 				return
 			}
 
-			c.signalMu.Lock()
-			close(c.signal)
-			c.signal = make(chan struct{})
-			c.signalMu.Unlock()
+			c.notify(message.Payload)
 		}
 	}
 }
