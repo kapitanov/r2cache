@@ -156,7 +156,7 @@ Redis clients remain shared and must support concurrent use.
 | ----------------------------- | ------------------ | ------------------------------------------------------------------ |
 | `RedisURL` / `UseRedisClient` | Required           | Select the Redis connection.                                       |
 | `Fetch`                       | Required           | Load a value from the backend.                                     |
-| `KeyPrefix`                | Empty namespace    | Isolate caches and replicas; Cluster needs a hash tag.              |
+| `KeyPrefix`                | Empty namespace    | Isolate caches and replicas; Cluster and Ring need a hash tag.      |
 | `TTL`                      | `5 * time.Minute`  | Set the lifetime of each stored value; minimum 1 ms.               |
 | `LeaseDuration`            | `30 * time.Second` | Set the recovery window for abandoned fetches; minimum 100 ms.     |
 | `LimitConcurrentFetches`      | Unlimited          | Limit active backend calls across the namespace; must be positive. |
@@ -293,12 +293,12 @@ Call `cache.Shutdown()` when finished. It is idempotent, cancels work, and waits
 active operations and callbacks. Do not call it from a fetcher or metrics receiver,
 since it would wait for that callback to return. Shared cached values remain intact.
 
-## Redis, Valkey, Sentinel, and Cluster
+## Redis, Valkey, Sentinel, Cluster, and Ring
 
 `RedisURL` accepts standalone `redis://` and TLS `rediss://` connections. R2Cache
 owns that client and closes it during shutdown.
 
-For Sentinel, Cluster, or custom authentication and transport, construct a
+For Sentinel, Cluster, Ring, or custom authentication and transport, construct a
 `redis.UniversalClient` and pass it through `builder.UseRedisClient(client)`:
 
 ```go
@@ -310,9 +310,10 @@ client := redis.NewUniversalClient(&redis.UniversalOptions{
 })
 ```
 
-Use `redis.NewClusterClient` for an explicit Cluster configuration. Injected clients
-remain caller-owned: shut down their caches before closing them. Configure clients
-to honor context deadlines and read from primaries.
+Use `redis.NewClusterClient` for an explicit Cluster configuration or
+`redis.NewRing` for a Redis Ring. Injected clients remain caller-owned: shut down
+their caches before closing them. Configure clients to honor context deadlines and
+read from primaries.
 
 `builder.KeyPrefix("my-cache")` preserves the prefix exactly and adds a `:` separator:
 keys include `my-cache:value:<encoded-key>` and `my-cache:hot`. Prefixes are never
@@ -320,21 +321,27 @@ hashed, escaped, or trimmed. An empty prefix adds no separator; a prefix already
 ending in `:` retains it, so `my-cache:` produces `my-cache::value:<encoded-key>`.
 User keys in value and lock names remain URL-safe base64 encoded.
 
-### Redis Cluster: one namespace, one hash slot
+### Redis Cluster and Redis Ring: one namespace, one shard
 
-A namespace is deliberately pinned to **one Redis Cluster hash slot**. Values,
+A namespace is deliberately pinned to **one shard**. Redis Cluster assigns hash
+slots and Redis Ring assigns shards by rendezvous hashing; either way, values,
 locks, concurrency permits, the hot and due indexes, refresh pacing, and the events
-channel all derive from `KeyPrefix`, and the Lua scripts address several of them in
-one call, so Redis rejects them with `CROSSSLOT` unless every key hashes to the same
-slot.
+channel all derive from `KeyPrefix`. The Lua scripts address several of them in one
+call, so the keys must stay together: Redis Cluster rejects a cross-slot script
+with `CROSSSLOT`, while Redis Ring would silently split coordination across shards.
 
-For **Redis Cluster**, the prefix must contain a non-empty Redis hash tag:
+For **Redis Cluster or Redis Ring**, the prefix must contain a non-empty Redis hash
+tag:
 
 ```go
-client := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"redis-0:6379"}})
+cluster := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"redis-0:6379"}})
+ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{
+	"shard-0": "redis-0:6379",
+	"shard-1": "redis-1:6379",
+}})
 cache, err := r2cache.NewBuilder[string, Product]().
-	UseRedisClient(client).
-	KeyPrefix("my-cache:{products}"). // all namespace keys hash to the slot of "products"
+	UseRedisClient(ring).              // or cluster
+	KeyPrefix("my-cache:{products}").  // all namespace keys hash to "products"
 	Fetch(fetchProduct).
 	Build()
 ```
@@ -343,9 +350,9 @@ Redis hashes only the content between the first `{` and the first `}` after it,
 and that content must be non-empty; later brace pairs are ignored. Thus
 `svc:{products}` and `a{b}c{d}` are accepted (tags `products` and `b`), while
 `svc`, `svc:{}`, and `a{}c{d}` are not. `Build` fails immediately, naming
-`KeyPrefix`, when an injected `*redis.ClusterClient` has no such tag; standalone
-Redis and Sentinel require no tag. The tag remains part of the prefix, so all
-replicas in the namespace must use it.
+`KeyPrefix`, when an injected `*redis.ClusterClient` or `*redis.Ring` has no such
+tag; standalone Redis and Sentinel require no tag. The tag remains part of the
+prefix, so all replicas in the namespace must use it.
 
 A namespace is bounded by one shard's capacity and shares that shard with other
 namespaces using the same tag. Use distinct tags for unrelated data; different tags
