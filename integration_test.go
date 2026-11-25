@@ -746,6 +746,9 @@ func TestIntegration(t *testing.T) {
 		policy := AutoRefreshPolicy{HotKeyLifetime: 2 * time.Second, UpdateInterval: 200 * time.Millisecond}
 		c := testCache(t, NewBuilder[string, int]().RedisURL(url).KeyPrefix(t.Name()).Fetch(fetch).EnableAutoRefresh(policy).TTL(3*time.Second))
 		mustGet(t, c, "warm")
+		// Issue #3 makes a cache miss stop marking the key hot, so read again for
+		// a hit; this keeps the key hot under both the old and new read semantics.
+		mustGet(t, c, "warm")
 		require.Equal(t, []string{"warm"}, c.HotKeys(ctx), "missing hot key")
 		select {
 		case <-refreshStarted:
