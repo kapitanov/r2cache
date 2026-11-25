@@ -195,12 +195,15 @@ func (b *Builder[K, V]) LeaseDuration(duration time.Duration) *Builder[K, V] {
 // Replicas in a namespace must use the same policy. Refresh deadlines are
 // best-effort under load or backend failures.
 type AutoRefreshPolicy struct {
-	// HotKeyLifetime is the time after the last external GetOrFetch read that
-	// found a stored value during which a key remains eligible for refresh. A
-	// miss does not start or extend this window; after a successful fetch, the
-	// key becomes eligible on the next read that hits. Background refreshes and
-	// HotKeys queries do not extend the window. It must exceed UpdateInterval,
-	// otherwise the key leaves the hot set before its refresh is due.
+	// HotKeyLifetime is the time after the last sampled external GetOrFetch read
+	// that found a stored value during which a key remains eligible for refresh.
+	// A miss does not start or extend this window; after a successful fetch, the
+	// key becomes eligible on the next read that hits. Reads record hotness at
+	// most once per sample window of min(UpdateInterval, HotKeyLifetime/2),
+	// clamped to at least 1ms, so eligibility is sampled and best-effort within
+	// that window. It must exceed UpdateInterval, so the hot entry outlives the
+	// refresh deadline and a continuously read key stays hot. Background
+	// refreshes and HotKeys queries do not extend this window.
 	HotKeyLifetime time.Duration
 
 	// UpdateInterval is the target delay from a successful fetch to its next
@@ -220,13 +223,14 @@ func (b *Builder[K, V]) DisableAutoRefresh() *Builder[K, V] {
 	return b
 }
 
-// EnableAutoRefresh enables hot-key tracking for external reads that find a
-// stored value and starts a background worker using policy. Refreshes use the
-// same per-key leases and global concurrency permits as foreground fetches.
-// Build fails when a duration is below one millisecond or when UpdateInterval is
-// not strictly less than both HotKeyLifetime and TTL. Refresh errors leave an
-// existing value until its TTL expires and defer that key by UpdateInterval from
-// the failure; they are not delivered to foreground readers.
+// EnableAutoRefresh enables sampled hot-key tracking for external reads that find
+// a stored value and starts a background worker using policy. Refreshes use the
+// same per-key leases and global concurrency permits as foreground fetches. With
+// refresh disabled, the read path performs no writes. Build fails when a duration
+// is below one millisecond or when UpdateInterval is not strictly less than both
+// HotKeyLifetime and TTL. Refresh errors leave an existing value until its TTL
+// expires and defer that key by UpdateInterval from the failure; they are not
+// delivered to foreground readers.
 func (b *Builder[K, V]) EnableAutoRefresh(policy AutoRefreshPolicy) *Builder[K, V] {
 	b.cfg.refresh = &policy
 	return b
@@ -286,8 +290,9 @@ type MetricValues struct {
 	// refreshes and calls that fail or are canceled.
 	BackendFetchCount int64
 
-	// HotKeyCount is the current number of eligible hot keys across the namespace.
-	// It is zero when refresh is disabled and -1 if Redis could not be queried.
+	// HotKeyCount is the current number of eligible hot keys across the namespace,
+	// based on sampled hotness. It is zero when refresh is disabled and -1 if Redis
+	// could not be queried.
 	HotKeyCount int64
 }
 
