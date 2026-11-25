@@ -48,4 +48,9 @@ var (
 	nextRefreshSource string
 
 	nextRefreshScript = redis.NewScript(nextRefreshSource)
+
+	//go:embed scripts/backoff.lua
+	backoffSource string
+
+	backoffScript = redis.NewScript(backoffSource)
 )

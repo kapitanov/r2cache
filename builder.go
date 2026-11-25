@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -92,6 +93,17 @@ func (b *Builder[K, V]) Build() (*Cache[K, V], error) {
 		if policy.HotKeyLifetime < time.Millisecond || policy.UpdateInterval < time.Millisecond {
 			return nil, errors.New("r2cache: refresh durations must be at least 1ms")
 		}
+		// Compare the whole milliseconds the Lua scripts actually use, so a
+		// truncated equality is rejected too.
+		interval := policy.UpdateInterval.Milliseconds()
+		if interval >= policy.HotKeyLifetime.Milliseconds() {
+			return nil, fmt.Errorf("r2cache: refresh UpdateInterval (%v) must be less than HotKeyLifetime (%v)",
+				policy.UpdateInterval, policy.HotKeyLifetime)
+		}
+		if interval >= cfg.ttl.Milliseconds() {
+			return nil, fmt.Errorf("r2cache: refresh UpdateInterval (%v) must be less than TTL (%v)",
+				policy.UpdateInterval, cfg.ttl)
+		}
 		cfg.refresh = &policy
 	}
 	return newCache(cfg)
@@ -178,20 +190,25 @@ func (b *Builder[K, V]) LeaseDuration(duration time.Duration) *Builder[K, V] {
 
 // AutoRefreshPolicy controls which recently accessed keys are refreshed and the
 // desired refresh cadence. Both durations must be at least one millisecond and
-// are truncated to whole milliseconds. Replicas in a namespace must use the same
-// policy. Refresh deadlines are best-effort under load or backend failures.
+// are truncated to whole milliseconds. UpdateInterval must be strictly less than
+// both HotKeyLifetime and the cache TTL; Build rejects any other combination.
+// Replicas in a namespace must use the same policy. Refresh deadlines are
+// best-effort under load or backend failures.
 type AutoRefreshPolicy struct {
 	// HotKeyLifetime is the time after the last external GetOrFetch read that
 	// found a stored value during which a key remains eligible for refresh. A
 	// miss does not start or extend this window; after a successful fetch, the
 	// key becomes eligible on the next read that hits. Background refreshes and
-	// HotKeys queries do not extend the window.
+	// HotKeys queries do not extend the window. It must exceed UpdateInterval,
+	// otherwise the key leaves the hot set before its refresh is due.
 	HotKeyLifetime time.Duration
 
 	// UpdateInterval is the target delay from a successful fetch to its next
-	// refresh. Failed or busy refresh attempts are deferred for another interval.
-	// Starts are spaced across hot keys and replicas to reduce bursts. Choose an
-	// interval below the TTL, with room for backend latency, to keep values warm.
+	// refresh. It must be strictly less than HotKeyLifetime and the cache TTL, so
+	// the hot entry and the stored value outlive the refresh deadline. After a
+	// failed refresh, that key is deferred for another full interval measured from
+	// the failure; busy attempts and keys that are no longer hot are not deferred.
+	// Starts are spaced across hot keys and replicas to reduce bursts.
 	UpdateInterval time.Duration
 }
 
@@ -206,9 +223,10 @@ func (b *Builder[K, V]) DisableAutoRefresh() *Builder[K, V] {
 // EnableAutoRefresh enables hot-key tracking for external reads that find a
 // stored value and starts a background worker using policy. Refreshes use the
 // same per-key leases and global concurrency permits as foreground fetches.
-// Invalid policy durations cause Build to fail. Refresh errors leave an existing
-// value until its TTL expires and are retried on a later interval; they are not
-// delivered to foreground readers.
+// Build fails when a duration is below one millisecond or when UpdateInterval is
+// not strictly less than both HotKeyLifetime and TTL. Refresh errors leave an
+// existing value until its TTL expires and defer that key by UpdateInterval from
+// the failure; they are not delivered to foreground readers.
 func (b *Builder[K, V]) EnableAutoRefresh(policy AutoRefreshPolicy) *Builder[K, V] {
 	b.cfg.refresh = &policy
 	return b

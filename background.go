@@ -79,6 +79,7 @@ func (c *Cache[K, V]) refresh() {
 	// One synchronous worker per replica bounds local background work. The shared
 	// scheduler spreads starts globally, including when many keys become due at once.
 
+	interval := c.cfg.refresh.UpdateInterval.Milliseconds()
 	delay := time.Millisecond
 	for {
 		timer := time.NewTimer(delay)
@@ -92,7 +93,7 @@ func (c *Cache[K, V]) refresh() {
 
 		op, stop := context.WithTimeout(c.ctx, 2*time.Second)
 
-		result, err := nextRefreshScript.Run(op, c.client, []string{c.base + "hot", c.base + "due", c.base + "pace"}, c.cfg.refresh.UpdateInterval.Milliseconds()).Slice()
+		result, err := nextRefreshScript.Run(op, c.client, []string{c.base + "hot", c.base + "due", c.base + "pace"}, interval).Slice()
 		stop()
 
 		delay = 100 * time.Millisecond
@@ -115,7 +116,14 @@ func (c *Cache[K, V]) refresh() {
 
 		if len(result) > 1 {
 			if key, ok := result[1].(string); ok {
-				_, _, _ = c.attempt(c.ctx, K(key), true)
+				if _, _, err := c.attempt(c.ctx, K(key), true); err != nil {
+					// The due time set before the attempt may already be past when a
+					// slow fetch fails. Defer from the failure instead; busy and
+					// no-longer-hot keys never reach this branch.
+					op, stop := context.WithTimeout(c.ctx, 2*time.Second)
+					_ = backoffScript.Run(op, c.client, []string{c.base + "hot", c.base + "due"}, key, interval).Err()
+					stop()
+				}
 			}
 		}
 	}

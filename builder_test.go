@@ -47,6 +47,42 @@ func TestBuilderValidation(t *testing.T) {
 	require.ErrorContains(t, err, "fetcher is required")
 }
 
+func TestBuilderRefreshPolicy(t *testing.T) {
+	tests := []struct {
+		name               string
+		hot, ttl, interval time.Duration
+		message            string
+	}{
+		{"interval above hot lifetime", time.Second, DefaultTTL, 2 * time.Second, "UpdateInterval (2s) must be less than HotKeyLifetime (1s)"},
+		{"interval equals hot lifetime", time.Second, DefaultTTL, time.Second, "UpdateInterval (1s) must be less than HotKeyLifetime (1s)"},
+		{"interval equals truncated hot lifetime", 1500 * time.Microsecond, DefaultTTL, time.Millisecond, "UpdateInterval (1ms) must be less than HotKeyLifetime (1.5ms)"},
+		{"interval above TTL", time.Minute, 5 * time.Second, 10 * time.Second, "UpdateInterval (10s) must be less than TTL (5s)"},
+		{"interval equals TTL", time.Minute, 5 * time.Second, 5 * time.Second, "UpdateInterval (5s) must be less than TTL (5s)"},
+		{"interval equals truncated TTL", time.Minute, 1500 * time.Microsecond, time.Millisecond, "UpdateInterval (1ms) must be less than TTL (1.5ms)"},
+		{"valid policy", time.Minute, DefaultTTL, time.Second, ""},
+		{"valid policy below both boundaries", time.Second, time.Second, 999 * time.Millisecond, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := offlineBuilder(t).TTL(tt.ttl).EnableAutoRefresh(AutoRefreshPolicy{
+				HotKeyLifetime: tt.hot,
+				UpdateInterval: tt.interval,
+			})
+			cache, err := builder.Build()
+			if tt.message == "" {
+				require.NoError(t, err)
+				require.NotNil(t, cache)
+				require.Equal(t, tt.hot, cache.cfg.refresh.HotKeyLifetime)
+				require.Equal(t, tt.interval, cache.cfg.refresh.UpdateInterval)
+				cache.Shutdown()
+				return
+			}
+			require.ErrorContains(t, err, tt.message)
+			require.Nil(t, cache)
+		})
+	}
+}
+
 // Build is deliberately offline: a closed caller-owned client is enough for
 // configuration tests, and its notification worker exits without dialing Redis.
 func offlineBuilder(t *testing.T) *Builder[string, int] {
