@@ -75,6 +75,44 @@ exec redis-server /tmp/sentinel.conf --sentinel`),
 	topologySmoke(t, client)
 }
 
+// Build rejects a Cluster namespace without a usable hash tag before issuing any
+// Redis command, so these cases need no server. Redis considers only the first
+// brace pair and requires non-empty content between the braces.
+func TestClusterKeyPrefixValidation(t *testing.T) {
+	client := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:0"}})
+	t.Cleanup(func() { _ = client.Close() })
+	tests := []struct {
+		name   string
+		prefix string
+		valid  bool
+	}{
+		{"empty prefix", "", false},
+		{"untagged prefix", "svc", false},
+		{"empty tag", "svc:{}", false},
+		{"empty first tag ignores later tag", "a{}c{d}", false},
+		{"unclosed tag", "svc:{products", false},
+		{"tagged prefix", "svc:{products}", true},
+		{"first tag precedes later braces", "a{b}c{d}", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache, err := NewBuilder[string, int]().
+				UseRedisClient(client).
+				KeyPrefix(tt.prefix).
+				Fetch(func(context.Context, string) (int, error) { return 0, nil }).
+				Build()
+			if !tt.valid {
+				require.ErrorContains(t, err, "KeyPrefix")
+				require.ErrorContains(t, err, "Redis Cluster requires a non-empty hash tag")
+				require.Nil(t, cache)
+				return
+			}
+			require.NoError(t, err)
+			cache.Shutdown()
+		})
+	}
+}
+
 func topologySmoke(t *testing.T, client redis.UniversalClient) {
 	t.Helper()
 	var calls atomic.Int64
