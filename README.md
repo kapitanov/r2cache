@@ -206,7 +206,8 @@ builder.EnableAutoRefresh(r2cache.AutoRefreshPolicy{
 value. A read that misses does not make the key hot: if its fetch succeeds, the
 key becomes refresh-eligible only when a later read finds the stored value. A
 failed fetch leaves no hot or due entry, so the background worker never retries
-it. Background refreshes and `HotKeys` queries do not extend the window.
+it. Background refreshes and `HotKeys`/`HotKeysLimit` queries do not extend the
+window.
 
 **Hotness is sampled to keep reads cheap.** The read path records a key's hotness
 at most once per sample window of `min(UpdateInterval, HotKeyLifetime/2)`, clamped
@@ -236,14 +237,30 @@ deferred this way. An existing value remains only until its original TTL. When
 nothing is due, the scheduler polls no faster than the configured interval and
 never sleeps longer than one second.
 
-`cache.HotKeys(ctx)` returns eligible keys across the namespace, oldest sampled
-access first. Because hotness is sampled, eligibility can end up to one sample
-window earlier than an exact last-read window would, and the reported order can
-lag by up to the same bound. A `nil` result means the answer is unavailable:
+`cache.HotKeys(ctx)` returns all eligible keys across the namespace, oldest
+sampled access first. Because hotness is sampled, eligibility can end up to one
+sample window earlier than an exact last-read window would, and the reported order
+can lag by up to the same bound. A `nil` result means the answer is unavailable:
 refresh is disabled, the cache is closed, the context is canceled, or Redis
 failed. A non-nil empty slice means the query succeeded and no keys are currently
 eligible. The slice-only signature carries no error, so compare against `nil`;
-`len(result) == 0` conflates the two cases.
+`len(result) == 0` conflates the two cases. The result is unbounded: Redis builds
+the entire reply and the call allocates O(n) keys, so cost grows with the number
+of keys read within `HotKeyLifetime`; opportunistic pruning can leave additional
+expired members in the index. Use it only when the full set is genuinely needed.
+
+`cache.HotKeysLimit(ctx, limit)` returns at most `limit` eligible keys in the same
+sampled, oldest-access-first order and reports whether more keys remain. It asks
+Redis for `limit+1` keys, so the reply and allocation are bounded by `limit`; it
+is the recommended call for request paths and large namespaces. A `limit` of zero
+or less returns `nil`. A successful empty result is a non-nil empty slice, while
+`nil` means unavailable (refresh disabled, closed cache, canceled context, or
+Redis failure) — never "no keys are hot".
+
+The expected cardinality of the hot index is the number of distinct keys with a
+sampled read within `HotKeyLifetime` in the namespace, with the
+opportunistic-pruning caveat above. Neither call imposes a hard cardinality cap;
+`HotKeysLimit` only caps the size of one reply.
 
 ## Coordination and recovery
 
