@@ -367,11 +367,11 @@ standard Testcontainers environment, including `DOCKER_HOST` where needed.
 Reports are ignored by Git. Coverage uses atomic counters with the race detector
 and measures Go statements, not Lua branches.
 
-The [test workflow](.github/workflows/test.yml) runs a Redis/Valkey matrix and
-publishes coverage summaries and artifacts. The separate [lint workflow](.github/workflows/lint.yml)
-runs on pushes and pull requests and annotates findings on GitHub. Local formatting,
-local linting, and CI share [`.golangci.yml`](.golangci.yml) and the version in
-[`.golangci-lint-version`](.golangci-lint-version).
+The [Go workflow](.github/workflows/go.yml) runs on pushes to `master` and on
+pull requests. It has a build/vet job, a Redis/Valkey test matrix that publishes
+coverage summaries and artifacts, and a lint job that annotates findings on
+GitHub. Local formatting, local linting, and CI share [`.golangci.yml`](.golangci.yml)
+and the version in [`.golangci-lint-version`](.golangci-lint-version).
 
 ### Project layout
 

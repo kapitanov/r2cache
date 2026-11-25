@@ -2,9 +2,12 @@ GO ?= go
 GOLANGCI_LINT_VERSION := $(shell cat .golangci-lint-version)
 GOLANGCI_LINT = $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: default build test vet fmt lint
+.PHONY: default check build test vet fmt lint
 
 default: build test vet lint
+
+# Alias for default: the complete local check suite.
+check: default
 
 build:
 	$(GO) build ./...

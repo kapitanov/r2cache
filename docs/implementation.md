@@ -41,7 +41,7 @@ values or backend errors are cached.
 ## Completed validation
 
 - `go test -short ./...`: passed without starting containers.
-- `make check`: build, vet, and race-enabled Redis integration tests passed.
+- `make check`: build, vet, lint, and race-enabled Redis integration tests passed.
 - `R2CACHE_TEST_IMAGE=valkey/valkey:8.0.2-alpine go test -race -count=1
   -coverprofile=/private/tmp/r2cache-coverage.out -timeout=5m ./...`: passed;
   Go statement coverage was 95.0% (this does not measure Lua branch coverage).
