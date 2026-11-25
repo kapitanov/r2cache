@@ -21,6 +21,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// cleanupTimeout bounds best-effort lock and permit releases run after an acquire
+// failure or a completed fetch. They use a fresh context because the caller's
+// context may already be canceled.
+const cleanupTimeout = 2 * time.Second
+
 // ErrClosed is returned by GetOrFetch when Shutdown has already begun. Operations
 // that were active when shutdown started are canceled instead. HotKeys reports a
 // closed cache through its nil result because its signature has no error return.
@@ -215,16 +220,31 @@ func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool
 		mode = 1
 	}
 
+	// discard releases a lock and permit that a failed acquire may have created
+	// server-side. It runs on a fresh context because the caller's context may be
+	// the cause of the failure. The release can race with an acquire still queued
+	// server-side: it may run before that acquire creates its lock, or another
+	// replica may already own the key. The token guard keeps a replacement lock
+	// intact, and the lease remains the backstop for anything left behind.
+	discard := func() {
+		cleanup, stop := context.WithTimeout(context.Background(), cleanupTimeout)
+		_ = releaseScript.Run(cleanup, c.client, []string{keys[1], keys[2], keys[5]}, token, string(key)).Err()
+		stop()
+	}
+
 	result, err := acquireScript.Run(ctx, c.client, keys[:4], token, c.cfg.lease.Milliseconds(), c.cfg.max, mode, string(key)).Slice()
 	if err != nil {
+		discard()
 		return zero, false, fmt.Errorf("r2cache: acquire: %w", err)
 	}
 	if len(result) == 0 {
+		discard()
 		return zero, false, errors.New("r2cache: empty acquire response")
 	}
 
 	status, ok := result[0].(int64)
 	if !ok {
+		discard()
 		return zero, false, errors.New("r2cache: invalid acquire status")
 	}
 
@@ -234,11 +254,13 @@ func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool
 
 	case 1:
 		if len(result) < 2 {
+			discard()
 			return zero, false, errors.New("r2cache: missing cached value")
 		}
 
 		data, ok := result[1].(string)
 		if !ok {
+			discard()
 			return zero, false, errors.New("r2cache: invalid cached value")
 		}
 
@@ -250,6 +272,7 @@ func (c *Cache[K, V]) attempt(ctx context.Context, key K, refresh bool) (V, bool
 		return value, true, err
 
 	default:
+		discard()
 		return zero, false, fmt.Errorf("r2cache: unknown acquire status %d", status)
 	}
 }
@@ -264,7 +287,7 @@ func (c *Cache[K, V]) fetch(ctx context.Context, key K, keys []string, token str
 	defer func() {
 		cancel(context.Canceled)
 		<-renewed
-		cleanup, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		cleanup, stop := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer stop()
 		_ = releaseScript.Run(cleanup, c.client, []string{keys[1], keys[2], keys[5]}, token, string(key)).Err()
 	}()
