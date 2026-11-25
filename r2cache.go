@@ -175,9 +175,10 @@ func (c *Cache[K, V]) decodeCached(valueKey, data string) (V, error) {
 //
 // With auto-refresh enabled, an initial lookup that finds a stored value records
 // this external access; a cache miss does not. A key fetched after a miss becomes
-// hot on a later read that hits. Hotness is sampled at most once per sample
-// window, so eligibility is best-effort within that window; background refreshes
-// do not extend it. With refresh disabled, the initial lookup performs no writes.
+// hot on a later read that hits, and that hit schedules its first background
+// refresh. Hotness is sampled at most once per sample window, so eligibility is
+// best-effort within that window; background refreshes do not extend it. With
+// refresh disabled, the initial lookup performs no writes.
 // The context bounds waiting and is passed to a callback owned by this call.
 // Canceling a waiter does not cancel another reader's fetch. Fetchers must honor
 // cancellation: the owning call waits for its callback to return before completing.
@@ -199,7 +200,7 @@ func (c *Cache[K, V]) GetOrFetch(ctx context.Context, key K) (V, error) {
 		interval = p.UpdateInterval.Milliseconds()
 	}
 
-	data, err := readScript.Run(ctx, c.client, []string{keys[0], keys[3]}, string(key), hot, interval).Text()
+	data, err := readScript.Run(ctx, c.client, []string{keys[0], keys[3], keys[4]}, string(key), hot, interval).Text()
 	if err == nil {
 		c.hits.Add(1)
 		return c.decodeCached(keys[0], data)
@@ -349,7 +350,7 @@ func (c *Cache[K, V]) fetch(ctx context.Context, key K, keys []string, token str
 		interval = c.cfg.refresh.UpdateInterval.Milliseconds()
 	}
 
-	committed, err := commitScript.Run(fetchCtx, c.client, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, token, data, c.cfg.ttl.Milliseconds(), c.cfg.max, string(key), interval, hot).Int()
+	committed, err := commitScript.Run(fetchCtx, c.client, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, token, data, c.cfg.ttl.Milliseconds(), c.cfg.max, string(key), interval, hot).Int()
 	if err != nil {
 		return zero, fmt.Errorf("r2cache: commit: %w", err)
 	}

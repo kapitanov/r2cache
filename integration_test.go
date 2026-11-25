@@ -317,7 +317,7 @@ func TestIntegration(t *testing.T) {
 		for _, command := range []string{"zadd", "zrem", "pexpire", "expire"} {
 			before[command] = commandCalls(t, admin, command)
 		}
-		_, err := readScript.Run(ctx, admin, []string{missing[0], missing[3]}, "missing", 0, 0).Text()
+		_, err := readScript.Run(ctx, admin, []string{missing[0], missing[3], missing[4]}, "missing", 0, 0).Text()
 		require.ErrorIs(t, err, redis.Nil)
 		require.Equal(t, beforeMiss, commandCalls(t, admin, "time"), "read miss issued TIME")
 		for _, command := range []string{"zadd", "zrem", "pexpire", "expire"} {
@@ -336,17 +336,17 @@ func TestIntegration(t *testing.T) {
 		keys := c.keys("key")
 
 		require.Equal(t, 1, mustGet(t, c, "key"), "initial miss fetch")
-		dueScore, err := admin.ZScore(ctx, keys[4], "key").Result()
-		require.NoError(t, err, "commit did not schedule the next refresh")
-		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val())
+		// A cold miss must not schedule background refresh: only hits make the
+		// key hot, and only a hot key is worth refreshing.
+		require.Zero(t, admin.ZCard(ctx, keys[4]).Val(), "cold commit scheduled the due index")
 		require.Zero(t, admin.Exists(ctx, keys[3]).Val(), "miss recorded hotness")
 
 		require.Equal(t, 1, mustGet(t, c, "key"), "first hit")
 		hotBefore, err := admin.ZScore(ctx, keys[3], "key").Result()
 		require.NoError(t, err, "hit did not record hotness")
-		dueBefore, err := admin.ZScore(ctx, keys[4], "key").Result()
-		require.NoError(t, err)
-		require.InDelta(t, dueScore, dueBefore, 0, "hit changed the due schedule")
+		dueScore, err := admin.ZScore(ctx, keys[4], "key").Result()
+		require.NoError(t, err, "hit did not schedule the next refresh")
+		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val())
 
 		require.Equal(t, 1, mustGet(t, c, "key"), "second immediate hit")
 		hotAfter, err := admin.ZScore(ctx, keys[3], "key").Result()
@@ -354,8 +354,8 @@ func TestIntegration(t *testing.T) {
 		require.InDelta(t, hotBefore, hotAfter, 0, "hot score written inside the sample window")
 		dueAfter, err := admin.ZScore(ctx, keys[4], "key").Result()
 		require.NoError(t, err)
-		require.InDelta(t, dueScore, dueAfter, 0, "read wrote the due index")
-		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val(), "read added a due member")
+		require.InDelta(t, dueScore, dueAfter, 0, "hit moved the due schedule")
+		require.Equal(t, int64(1), admin.ZCard(ctx, keys[4]).Val(), "hit added a second due member")
 
 		// After the sample window, the next hit records access again.
 		sample := min(policy.UpdateInterval, policy.HotKeyLifetime/2)
@@ -364,8 +364,8 @@ func TestIntegration(t *testing.T) {
 			now, err := admin.Time(ctx).Result()
 			return err == nil && float64(now.UnixMilli()) >= lastAccess+float64(sample.Milliseconds())
 		})
-		// The due entry from the first commit fires during the window. A
-		// background refresh replaces the value but must not touch the hot score.
+		// The due entry from the first hit fires during the window. A background
+		// refresh replaces the value but must not touch the hot score.
 		eventually(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 		indexed, err := admin.ZScore(ctx, keys[3], "key").Result()
 		require.NoError(t, err)
@@ -1126,7 +1126,7 @@ func TestIntegration(t *testing.T) {
 		renewed, err := renewScript.Run(ctx, admin, []string{keys[1], keys[2]}, "old", 1000, 1).Int()
 		require.NoError(t, err)
 		require.Zero(t, renewed, "renewed expired permit")
-		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "old", "1", 1000, 1, "key", 0, 0).Int()
+		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, "old", "1", 1000, 1, "key", 0, 0).Int()
 		require.NoError(t, err)
 		require.Zero(t, committed, "committed with expired permit")
 		require.Zero(t, admin.Exists(ctx, keys[0]).Val(), "expired owner stored a value")
@@ -1166,7 +1166,7 @@ func TestIntegration(t *testing.T) {
 		require.Equal(t, "token-a", admin.Get(ctx, keys[1]).Val())
 
 		payload := "42"
-		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-a", payload, 30000, 1, "key", 0).Int()
+		committed, err := commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, "token-a", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
@@ -1175,7 +1175,7 @@ func TestIntegration(t *testing.T) {
 		require.ErrorIs(t, err, redis.Nil)
 
 		// Replaying the commit with the same token and payload reports the earlier success.
-		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-a", payload, 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, "token-a", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed, "replayed commit reported lost lease")
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
@@ -1184,14 +1184,14 @@ func TestIntegration(t *testing.T) {
 		// A different token with the already stored payload also reports the stored
 		// result without side effects; the contract only forbids overwriting and
 		// resurrecting ownership.
-		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-b", payload, 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, "token-b", payload, 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Equal(t, 1, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val())
 		require.Zero(t, admin.Exists(ctx, keys[1]).Val(), "replay resurrected ownership")
 
 		// A different payload from a non-owner must not overwrite the value.
-		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5]}, "token-b", "other", 30000, 1, "key", 0).Int()
+		committed, err = commitScript.Run(ctx, admin, []string{keys[0], keys[1], keys[2], keys[4], keys[5], keys[3]}, "token-b", "other", 30000, 1, "key", 0).Int()
 		require.NoError(t, err)
 		require.Zero(t, committed)
 		require.Equal(t, payload, admin.Get(ctx, keys[0]).Val(), "lost owner overwrote the value")
